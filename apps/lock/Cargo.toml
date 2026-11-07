@@ -1,0 +1,16 @@
+[package]
+name = "matrix-lock"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Matrix Sperre — der Sperrschirm: echtes ext-session-lock + PAM, im Haus (ohne iced)"
+build = "build.rs"
+
+[dependencies]
+matrixkit-theme = { path = "../../matrixkit-theme" }
+matrixkit-scene = { path = "../../matrixkit-scene" }
+matrixkit-shell = { path = "../../matrixkit-shell" }
+matrixkit-text = { path = "../../matrixkit-text" }
+matrixkit-image = { path = "../../matrixkit-image" }
+matrixkit-icons = { path = "../../matrixkit-icons" }
+libc = "0.2"

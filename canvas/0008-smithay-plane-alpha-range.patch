@@ -1,0 +1,82 @@
+diff --git a/src/backend/drm/device/atomic.rs b/src/backend/drm/device/atomic.rs
+index b0ddf1d4..7fec14bf 100644
+--- a/src/backend/drm/device/atomic.rs
++++ b/src/backend/drm/device/atomic.rs
+@@ -28,9 +28,18 @@ pub struct PropMapping {
+     pub connectors: HashMap<connector::Handle, HashMap<String, property::Handle>>,
+     pub crtcs: HashMap<crtc::Handle, HashMap<String, property::Handle>>,
+     pub planes: HashMap<plane::Handle, HashMap<String, property::Handle>>,
++    /// Upper end of each plane's `alpha` range (Matrix R209, see `plane_alpha_max`).
++    pub plane_alpha_max: HashMap<plane::Handle, u64>,
+ }
+ 
+ impl PropMapping {
++    /// Matrix (R209): full opacity in the plane's own `alpha` range. The DRM convention is 16 bit
++    /// (0..=0xffff), but msm_drm/SDE on the Android 4.14 kernel (Surface Duo) exposes 0..=255 and
++    /// rejects 0xffff with EINVAL -- every atomic test commit failed and no output came up.
++    pub(crate) fn plane_alpha_max(&self, handle: plane::Handle) -> u64 {
++        self.plane_alpha_max.get(&handle).copied().unwrap_or(0xffff)
++    }
++
+     pub(crate) fn conn_prop_handle(
+         &self,
+         handle: connector::Handle,
+@@ -134,6 +143,14 @@ impl AtomicDrmDevice {
+         map_props(&dev.fd, res_handles.connectors(), &mut mapping.connectors)?;
+         map_props(&dev.fd, res_handles.crtcs(), &mut mapping.crtcs)?;
+         map_props(&dev.fd, &planes, &mut mapping.planes)?;
++        for plane in planes.iter() {
++            let alpha = mapping.planes.get(plane).and_then(|props| props.get("alpha")).copied();
++            if let Some(info) = alpha.and_then(|prop| dev.fd.get_property(prop).ok()) {
++                if let property::ValueType::UnsignedRange(_, max) = info.value_type() {
++                    mapping.plane_alpha_max.insert(*plane, max);
++                }
++            }
++        }
+ 
+         dev.old_state = old_state;
+         trace!("Mapping: {:#?}", mapping);
+diff --git a/src/backend/drm/surface/atomic.rs b/src/backend/drm/surface/atomic.rs
+index 318aa9fe..dc5027c4 100644
+--- a/src/backend/drm/surface/atomic.rs
++++ b/src/backend/drm/surface/atomic.rs
+@@ -1252,7 +1252,9 @@ impl<'a> AtomicRequest<'a> {
+             if self.mapping.plane_prop_handle(handle, "alpha").is_ok() {
+                 plane_props.insert(
+                     "alpha",
+-                    property::Value::UnsignedRange((config.alpha * u16::MAX as f32).round() as u64),
++                    property::Value::UnsignedRange(
++                        (config.alpha * self.mapping.plane_alpha_max(handle) as f32).round() as u64,
++                    ),
+                 );
+             } else if config.alpha != 1.0 {
+                 // if we are missing the alpha property we can not display any transparent alpha values
+@@ -1310,7 +1312,7 @@ impl<'a> AtomicRequest<'a> {
+             );
+         }
+         if self.mapping.plane_prop_handle(plane, "alpha").is_ok() {
+-            plane_props.insert("alpha", property::Value::UnsignedRange(0xffff));
++            plane_props.insert("alpha", property::Value::UnsignedRange(self.mapping.plane_alpha_max(plane)));
+         }
+         if self.mapping.plane_prop_handle(plane, "FB_DAMAGE_CLIPS").is_ok() {
+             plane_props.insert("FB_DAMAGE_CLIPS", property::Value::Blob(0));
+@@ -1501,7 +1503,9 @@ impl<'a> AtomicRequest<'a> {
+                 self.request.add_property(
+                     handle,
+                     prop,
+-                    property::Value::UnsignedRange((config.alpha * u16::MAX as f32).round() as u64),
++                    property::Value::UnsignedRange(
++                        (config.alpha * self.mapping.plane_alpha_max(handle) as f32).round() as u64,
++                    ),
+                 );
+             } else if config.alpha != 1.0 {
+                 // if we are missing the alpha property we can not display any transparent alpha values
+@@ -1606,7 +1610,7 @@ impl<'a> AtomicRequest<'a> {
+         }
+         if let Ok(prop) = self.mapping.plane_prop_handle(plane, "alpha") {
+             self.request
+-                .add_property(plane, prop, property::Value::UnsignedRange(0xffff));
++                .add_property(plane, prop, property::Value::UnsignedRange(self.mapping.plane_alpha_max(plane)));
+         }
+         if let Ok(prop) = self.mapping.plane_prop_handle(plane, "FB_DAMAGE_CLIPS") {
+             self.request.add_property(plane, prop, property::Value::Blob(0));

@@ -1,0 +1,23 @@
+diff --git a/src/desktop/wayland/layer.rs b/src/desktop/wayland/layer.rs
+index a49ac9ae..46912915 100644
+--- a/src/desktop/wayland/layer.rs
++++ b/src/desktop/wayland/layer.rs
+@@ -91,6 +91,18 @@ impl LayerMap {
+             }
+ 
+             self.layers.insert(layer.clone());
++            // Matrix R204: surfaces of the Raum (namespace
++            // matrix-hardtext*) sink to the BOTTOM of their layer,
++            // regardless of map order — the dock (Layer::Top, mapped
++            // at session start) must stay above the scrolling bodies,
++            // or its tiles become unreachable the moment a Raum
++            // opens. Stable sort: everything else keeps map order,
++            // and the exit body (mapped last) stays atop its kin.
++            self.layers.sort_by(|a, b| {
++                let rank =
++                    |s: &LayerSurface| u8::from(!s.namespace().starts_with("matrix-hardtext"));
++                rank(a).cmp(&rank(b))
++            });
+             self.arrange();
+         }
+         Ok(())

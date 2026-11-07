@@ -1,0 +1,10 @@
+[package]
+name = "matrixkit-text"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+description = "Matrix Textmaschine — cosmic-text aus erster Hand: messen vor dem Layout, malen in den Puffer"
+
+[dependencies]
+matrixkit-theme = { path = "../matrixkit-theme" }
+cosmic-text = "0.15"

@@ -1,0 +1,21 @@
+--- a/src/input/backend_ext.rs
++++ b/src/input/backend_ext.rs
+@@ -24,9 +24,15 @@
+ }
+ 
+ impl NiriInputDevice for libinput::Device {
+-    fn output(&self, _state: &State) -> Option<Output> {
+-        // FIXME: Allow specifying the output per-device?
+-        None
++    fn output(&self, state: &State) -> Option<Output> {
++        // Matrix (R209, Surface Duo): per-device output from the udev property WL_OUTPUT, the
++        // convention wlroots and mutter follow. A device with two screens has one touchscreen per
++        // panel; with the single global `touch { map-to-output }` both panels would land on the
++        // same output. Devices without the property keep the global mapping (None).
++        // SAFETY: the udev context is the one libinput was created from (smithay's udev backend).
++        let udev = unsafe { self.udev_device() }?;
++        let name = udev.property_value("WL_OUTPUT")?.to_str()?;
++        state.niri.output_by_name_match(name).cloned()
+     }
+ }
+ 

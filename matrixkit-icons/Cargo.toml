@@ -1,0 +1,14 @@
+[package]
+name = "matrixkit-icons"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+description = "Lebende App-Icons — generiert aus der aktuellen System-Palette"
+
+[dependencies]
+matrixkit-theme = { path = "../matrixkit-theme" }
+# Round 88: icon themes (WhiteSur …) are SVG — the kit's own rasterizer.
+matrixkit-canvas = { path = "../matrixkit-canvas" }
+tiny-skia = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

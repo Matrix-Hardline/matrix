@@ -1,0 +1,14 @@
+[package]
+name = "matrixkit-video"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+description = "Matrix Video — Bewegtbild mit Ton ohne iced: ein ffmpeg-Kind, Bilder als RGBA, Ton nach PipeWire"
+
+[dependencies]
+matrixkit-image = { path = "../matrixkit-image" }
+# Round 102: film (screencopy + GPU NV12)
+matrixkit-shell = { path = "../matrixkit-shell" }
+matrixkit-gpu = { path = "../matrixkit-gpu" }
+libc = "0.2"
+serde_json = "1"

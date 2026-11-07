@@ -1,0 +1,33 @@
+diff --git a/src/input/canvas.rs b/src/input/canvas.rs
+index 2f6b908..bdd1de8 100644
+--- a/src/input/canvas.rs
++++ b/src/input/canvas.rs
+@@ -38,8 +38,11 @@ pub fn drag_start(
+         return false;
+     }
+     let pointer = state.niri.seat.get_pointer().unwrap();
++    // Matrix 0020: a locked session has no canvas — the lock surface takes
++    // every press (it is neither window nor layer, so it looked «empty»).
+     if pointer.is_grabbed()
+         || is_overview_open
++        || state.niri.is_locked()
+         || !state.niri.config.borrow().gestures.canvas_drag
+     {
+         return false;
+@@ -182,7 +185,7 @@ pub fn wheel_paging(
+             d.x * d.x + d.y * d.y <= 24.0 * 24.0
+         }
+     });
+-    if !(empty_space(&under) || sticky) {
++    if state.niri.is_locked() || !(empty_space(&under) || sticky) {
+         return false;
+     }
+     let ticks = if source == AxisSource::Wheel {
+@@ -232,6 +235,7 @@ pub fn swipe_start(
+         || state.niri.screenshot_ui.is_open()
+         || state.niri.window_mru_ui.is_open()
+         || state.niri.layout.is_overview_open()
++        || state.niri.is_locked()
+         || !mods_empty
+         || !empty_space(under)
+     {

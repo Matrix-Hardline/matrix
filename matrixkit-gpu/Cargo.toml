@@ -1,0 +1,18 @@
+[package]
+name = "matrixkit-gpu"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+description = "Matrix GPU-Malerei — wgpu direkt auf der wl_surface, ohne iced"
+
+[dependencies]
+wgpu = "27"
+# Round 100: dmabuf import into the NV12 converter (the same ash as wgpu-hal).
+ash = "0.38"
+raw-window-handle = "0.6"
+# Stage 3: the glyph atlas — iced's standalone crate over
+# cosmic-text, WITHOUT iced itself (dig, camp 4, path A).
+cryoglyph = "0.1"
+cosmic-text = "0.15"
+# The language (06.11.2026): what the screen shows passes mk::language::shown.
+matrixkit-theme = { path = "../matrixkit-theme" }

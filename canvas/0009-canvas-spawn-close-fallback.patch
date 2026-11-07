@@ -1,0 +1,33 @@
+--- a/src/utils/spawning.rs
++++ b/src/utils/spawning.rs
+@@ -303,8 +303,28 @@
+                             #[cfg(not(target_os = "openbsd"))]
+                             {
+                                 let raw = pipe.as_raw_fd() as u32;
+-                                let _ = close_range(0, raw - 1, 0);
+-                                let _ = close_range(raw + 1, !0, 0);
++                                let below = close_range(0, raw - 1, 0);
++                                let above = close_range(raw + 1, !0, 0);
++                                // Matrix (R209, Surface Duo): close_range exists since Linux 5.9;
++                                // on the duo's Android 4.14 kernel it fails with ENOSYS. The
++                                // intermediate child then kept every inherited fd — including
++                                // the one Command::spawn() waits on — so spawn() never returned,
++                                // the child never got the exit signal, and each launch left a
++                                // stuck helper, a stuck niri thread and later a zombie behind.
++                                // Fall back to closing one by one (close() is safe after fork).
++                                if below != 0 || above != 0 {
++                                    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
++                                    let max = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
++                                        limit.rlim_cur.min(1 << 20) as u32
++                                    } else {
++                                        65536
++                                    };
++                                    for fd in 0..max {
++                                        if fd != raw {
++                                            libc::close(fd as i32);
++                                        }
++                                    }
++                                }
+                             }
+                             #[cfg(target_os = "openbsd")]
+                             {

@@ -1,0 +1,33 @@
+diff --git a/src/layer/mapped.rs b/src/layer/mapped.rs
+index 01a2095..4c05c56 100644
+--- a/src/layer/mapped.rs
++++ b/src/layer/mapped.rs
+@@ -371,7 +371,28 @@ impl MappedLayer {
+                 let hidden = |r: &Rectangle<f64, Logical>| r.size.w <= 2.0 || r.size.h <= 2.0;
+                 let shown = g.shown();
+                 let melt_now = g.melt();
++                // Matrix (0022): a chip that only changes its WIDTH in place —
++                // same top and height, one edge or the middle kept (the app
++                // name chip on a new name) — is no flow: the body jumps with
++                // its content. Gliding there lagged behind the name, and
++                // growing by a tenth melted it into its neighbours (too big),
++                // shrinking let go (too small).
++                let in_place = |old: &Rectangle<f64, Logical>, new: &Rectangle<f64, Logical>| {
++                    let near = |a: f64, b: f64| (a - b).abs() < 1.5;
++                    let (ol, nl) = (old.loc.x, new.loc.x);
++                    let (or, nr) = (old.loc.x + old.size.w, new.loc.x + new.size.w);
++                    near(old.loc.y, new.loc.y)
++                        && near(old.size.h, new.size.h)
++                        && (near(ol, nl) || near(or, nr) || near((ol + or) / 2.0, (nl + nr) / 2.0))
++                };
++                let gliding = g.anim.as_ref().is_some_and(|a| !a.is_done());
+                 match shown {
++                    Some(old) if !gliding && in_place(&old, &geometry) => {
++                        g.from = None;
++                        g.anim = None;
++                        g.melt_from = melt_now;
++                        g.melt_to = melt_now;
++                    }
+                     Some(old) if !hidden(&old) && !hidden(&geometry) => {
+                         // Growing by more than a tenth melts (chips flowing
+                         // into one band), shrinking as much lets go; a

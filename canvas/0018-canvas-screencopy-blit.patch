@@ -1,0 +1,167 @@
+diff --git a/src/backend/tty.rs b/src/backend/tty.rs
+index 59c811e..1dd2c8f 100644
+--- a/src/backend/tty.rs
++++ b/src/backend/tty.rs
+@@ -32,7 +32,7 @@ use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface}
+ use smithay::backend::renderer::gles::GlesRenderer;
+ use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
+ use smithay::backend::renderer::multigpu::{GpuManager, MultiFrame, MultiRenderer};
+-use smithay::backend::renderer::{DebugFlags, ImportDma, ImportEgl, RendererSuper};
++use smithay::backend::renderer::{Bind, DebugFlags, ImportDma, ImportEgl, RendererSuper};
+ use smithay::backend::session::libseat::LibSeatSession;
+ use smithay::backend::session::{Event as SessionEvent, Session};
+ use smithay::backend::udev::{self, UdevBackend, UdevEvent};
+@@ -51,7 +51,7 @@ use smithay::reexports::input::Libinput;
+ use smithay::reexports::rustix::fs::OFlags;
+ use smithay::reexports::wayland_protocols;
+ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+-use smithay::utils::{DeviceFd, Transform};
++use smithay::utils::{DeviceFd, Rectangle, Transform};
+ use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal};
+ use smithay::wayland::drm_lease::{
+     DrmLease, DrmLeaseBuilder, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
+@@ -1961,6 +1961,11 @@ impl Tty {
+ 
+         let mut rv = RenderResult::Skipped;
+ 
++        // Matrix (0018): copies of this output's next frame. Every early
++        // return below drops them — a dropped copy reports «failed», the
++        // client never waits forever.
++        let frame_copies = niri.take_frame_copies(output);
++
+         let tty_state: &TtyOutputState = output.user_data().get().unwrap();
+         let Some(device) = self.devices.get_mut(&tty_state.node) else {
+             error!("missing output device");
+@@ -1982,6 +1987,8 @@ impl Tty {
+ 
+         if !first_light::may_render(&surface.name.connector) {
+             // Matrix: wait for the leading panel's first frame (see first_light).
++            // (the frame copies drop here: «failed», the client falls back)
++            drop(frame_copies);
+             niri.queue_redraw(output);
+             return rv;
+         }
+@@ -2048,6 +2055,38 @@ impl Tty {
+         let drm_compositor = &mut surface.compositor;
+         match drm_compositor.render_frame::<_, _>(&mut renderer, &elements, [0.; 4], flags) {
+             Ok(res) => {
++                // Matrix (0018): the finished frame into the waiting copies.
++                if !frame_copies.is_empty() {
++                    let _span = tracy_client::span!("blit for screencopy");
++                    let size = output.current_mode().map(|m| m.size).unwrap_or_default();
++                    let transform = output.current_transform();
++                    let scale = output.current_scale().fractional_scale();
++                    for copy in frame_copies {
++                        let crate::protocols::screencopy::ScreencopyBuffer::Dmabuf(dmabuf) = copy.buffer() else {
++                            continue;
++                        };
++                        let mut dmabuf = dmabuf.clone();
++                        let blitted = match renderer.bind(&mut dmabuf) {
++                            Ok(mut fb) => res
++                                .blit_frame_result(
++                                    size,
++                                    transform,
++                                    scale,
++                                    &mut renderer,
++                                    &mut fb,
++                                    [Rectangle::from_size(size)],
++                                    [],
++                                )
++                                .map_err(|err| format!("{err:?}")),
++                            Err(err) => Err(format!("{err:?}")),
++                        };
++                        match blitted {
++                            Ok(sync) => copy.submit_after_sync(false, Some(sync), &niri.event_loop),
++                            Err(err) => warn!("error blitting for screencopy: {err}"),
++                        }
++                    }
++                }
++
+                 let needs_sync = res.needs_sync()
+                     || self
+                         .config
+diff --git a/src/handlers/mod.rs b/src/handlers/mod.rs
+index 3532078..3c5b64f 100644
+--- a/src/handlers/mod.rs
++++ b/src/handlers/mod.rs
+@@ -645,6 +645,18 @@ impl ScreencopyHandler for State {
+         // otherwise render it immediately.
+         if screencopy.with_damage() {
+             self.niri.screencopy_state.push(manager, screencopy);
++        } else if self.niri.monitors_active
++            && matches!(self.backend, crate::backend::Backend::Tty(_))
++            && matches!(screencopy.buffer(), crate::protocols::screencopy::ScreencopyBuffer::Dmabuf(_))
++            && screencopy.region_loc() == smithay::utils::Point::from((0, 0))
++            && !self.niri.dark_outputs.contains(&screencopy.output().name())
++            && std::env::var_os("NIRI_CANVAS_SCREENCOPY_RENDER").is_none()
++        {
++            // Matrix (0018): a whole output into a dmabuf — copied from the
++            // next frame of the output (a GPU blit) instead of rendering the
++            // scene again right now. Filming at 30 fps cost niri ~50 % of a
++            // core on the Surface Duo and made the picture stutter.
++            self.niri.queue_frame_copy(screencopy);
+         } else {
+             self.backend.with_primary_renderer(|renderer| {
+                 if let Err(err) = self
+diff --git a/src/niri.rs b/src/niri.rs
+index 91d3e32..4b4746b 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -286,6 +286,12 @@ pub struct Niri {
+     pub foreign_toplevel_state: ForeignToplevelManagerState,
+     pub ext_workspace_state: ExtWorkspaceManagerState,
+     pub screencopy_state: ScreencopyManagerState,
++    /// Matrix (0018): whole-output dmabuf screencopies waiting for the next
++    /// frame of their output — the TTY backend BLITS the finished frame into
++    /// them instead of rendering the scene a second time.
++    pub frame_copies: Vec<(u64, Screencopy)>,
++    /// Matrix (0018): numbers the frame copies (their safety timers).
++    pub frame_copy_serial: u64,
+     pub output_management_state: OutputManagementManagerState,
+     pub viewporter_state: ViewporterState,
+     pub background_effect_state: BackgroundEffectState,
+@@ -2556,6 +2562,8 @@ impl Niri {
+             ext_workspace_state,
+             output_management_state,
+             screencopy_state,
++            frame_copies: Vec::new(),
++            frame_copy_serial: 0,
+             viewporter_state,
+             background_effect_state,
+             xdg_foreign_state,
+@@ -3727,6 +3735,35 @@ impl Niri {
+         }
+     }
+ 
++    /// Matrix (0018): take the frame copies waiting for `output`.
++    pub fn take_frame_copies(&mut self, output: &Output) -> Vec<Screencopy> {
++        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.frame_copies)
++            .into_iter()
++            .partition(|(_, s)| s.output() == output);
++        self.frame_copies = rest;
++        mine.into_iter().map(|(_, s)| s).collect()
++    }
++
++    /// Matrix (0018): queue a frame copy; should its output not draw within
++    /// 500 ms (a dark panel, a stalled output), it is dropped — the client
++    /// hears «failed» and falls back instead of waiting forever.
++    pub fn queue_frame_copy(&mut self, screencopy: Screencopy) {
++        use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
++        let output = screencopy.output().clone();
++        self.frame_copy_serial += 1;
++        let serial = self.frame_copy_serial;
++        self.frame_copies.push((serial, screencopy));
++        self.queue_redraw(&output);
++        let timer = Timer::from_duration(Duration::from_millis(500));
++        let _ = self.event_loop.insert_source(timer, move |_, _, state| {
++            if let Some(i) = state.niri.frame_copies.iter().position(|(s, _)| *s == serial) {
++                warn!("screencopy: output did not draw in time, copy dropped");
++                drop(state.niri.frame_copies.remove(i));
++            }
++            TimeoutAction::Drop
++        });
++    }
++
+     /// Schedules an immediate redraw if one is not already scheduled.
+     pub fn queue_redraw(&mut self, output: &Output) {
+         let state = self.output_state.get_mut(output).unwrap();

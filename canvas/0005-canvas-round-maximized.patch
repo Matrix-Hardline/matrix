@@ -1,0 +1,36 @@
+--- a/src/layout/tile.rs
++++ b/src/layout/tile.rs
+@@ -1069,10 +1069,32 @@
+         // Clip to geometry including during the fullscreen animation to help with buggy clients
+         // that submit a full-sized buffer before acking the fullscreen state (Firefox).
+         let clip_to_geometry = fullscreen_progress < 1. && rules.clip_to_geometry == Some(true);
++
++        // Matrix: upstream flattens the corner radius as soon as a window is
++        // "expanded" — that means maximized OR fullscreen. For fullscreen the
++        // assumption holds: the window lies edge to edge on the output, and a
++        // rounded corner would be a notch into nothing.
++        //
++        // On the canvas it does not hold for maximized. Maximizing here keeps
++        // the very same air (`gaps`) to the screen edges and to the shelf that
++        // an ordinary window keeps — it is a normal window, only bigger, so it
++        // has to keep its corners. Without this, every maximized window sat in
++        // its gap with four square corners (measured on the Surface: the
++        // outline was a perfect rectangle at any configured radius, while an
++        // unmaximized window of the same app rounded correctly).
++        //
++        // Only the RADIUS is rescued here. Border, shadow and focus ring keep
++        // the upstream behaviour — their alpha still rides on
++        // `expanded_progress` — so the layout metrics stay untouched.
++        let flatten = if self.sizing_mode.is_fullscreen() {
++            expanded_progress
++        } else {
++            0.
++        };
+         let radius = self
+             .window
+             .geometry_corner_radius()
+-            .scaled_by(1. - expanded_progress as f32);
++            .scaled_by(1. - flatten as f32);
+ 
+         // Popups go on top, whether it's resize or not.
+         self.window.render_popups(

@@ -1,0 +1,21 @@
+--- a/src/backend/tty.rs	2026-11-01 21:32:38.570421043 +0100
++++ b/src/backend/tty.rs	2026-11-01 21:32:38.584009540 +0100
+@@ -2944,6 +2944,18 @@
+ }
+ 
+ fn refresh_interval(mode: DrmMode) -> Duration {
++    // Matrix canvas: some DSI command-mode panels report mode timings that
++    // compute to a wrong refresh — the Surface Duo says 21.932 Hz while its
++    // vblank runs at 60 Hz, and the frame clock then paced every output to
++    // ~20 frames/s. NIRI_CANVAS_REFRESH_HZ names the real rate.
++    if let Some(hz) = std::env::var("NIRI_CANVAS_REFRESH_HZ")
++        .ok()
++        .and_then(|v| v.trim().parse::<f64>().ok())
++        .filter(|hz| (10.0..=500.0).contains(hz))
++    {
++        return Duration::from_secs_f64(1.0 / hz);
++    }
++
+     let clock = mode.clock() as u64;
+     let htotal = mode.hsync().2 as u64;
+     let vtotal = mode.vsync().2 as u64;

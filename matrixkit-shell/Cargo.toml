@@ -1,0 +1,26 @@
+[package]
+name = "matrixkit-shell"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+description = "Matrix Fensterhaus — die iced-freie Laufzeit: Wayland aus erster Hand, Szene rein, Flecken raus"
+
+[dependencies]
+matrixkit-theme = { path = "../matrixkit-theme" }
+matrixkit-text = { path = "../matrixkit-text" }
+matrixkit-image = { path = "../matrixkit-image" }
+matrixkit-canvas = { path = "../matrixkit-canvas" }
+matrixkit-gpu = { path = "../matrixkit-gpu" }
+wayland-client = "0.31"
+# GPU seam (stage 1): wgpu/Vulkan need REAL libwayland pointers —
+# the system backend instead of the Rust implementation.
+# dlopen instead of link time: on the immutable host the
+# wayland-client.pc of the devel packages is missing — the .so.0 is there at runtime
+# anyway (niri runs on it).
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+memmap2 = "0.9"
+libc = "0.2"
+# Stage 19: decode the compositor's keymap.
+xkbcommon = "0.8"

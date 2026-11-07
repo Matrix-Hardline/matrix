@@ -1,0 +1,62 @@
+--- a/src/backend/tty.rs
++++ b/src/backend/tty.rs
+@@ -81,6 +81,16 @@
+     Fourcc::Abgr8888,
+ ];
+ 
++/// Matrix (R209, Surface Duo): msm_drm/SDE on the Android 4.14 kernel lists 10-bit formats on the
++/// primary plane but rejects an XRGB2101010 framebuffer in the atomic test commit (EINVAL), and
++/// smithay gives up after the first format. Last resort: 8-bit formats only.
++const COLOR_FORMATS_8BIT: [Fourcc; 4] = [
++    Fourcc::Xrgb8888,
++    Fourcc::Xbgr8888,
++    Fourcc::Argb8888,
++    Fourcc::Abgr8888,
++];
++
+ pub struct Tty {
+     config: Rc<RefCell<Config>>,
+     session: LibSeatSession,
+@@ -1471,18 +1481,38 @@
+                     .drm
+                     .create_surface(crtc, mode, &[connector.handle()])?;
+ 
+-                DrmCompositor::new(
++                let res = DrmCompositor::new(
+                     OutputModeSource::Auto(output.downgrade()),
+                     surface,
+                     None,
+                     device.allocator.clone(),
+                     GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
+                     SUPPORTED_COLOR_FORMATS,
+-                    render_formats,
++                    render_formats.clone(),
+                     device.drm.cursor_size(),
+                     Some(device.gbm.clone()),
+-                )
+-                .context("error creating DRM compositor")?
++                );
++                match res {
++                    Ok(x) => x,
++                    Err(err) => {
++                        warn!("error creating DRM compositor, will try 8-bit color formats: {err:?}");
++                        let surface = device
++                            .drm
++                            .create_surface(crtc, mode, &[connector.handle()])?;
++                        DrmCompositor::new(
++                            OutputModeSource::Auto(output.downgrade()),
++                            surface,
++                            None,
++                            device.allocator.clone(),
++                            GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
++                            COLOR_FORMATS_8BIT,
++                            render_formats,
++                            device.drm.cursor_size(),
++                            Some(device.gbm.clone()),
++                        )
++                        .context("error creating DRM compositor")?
++                    }
++                }
+             }
+         };
+ 

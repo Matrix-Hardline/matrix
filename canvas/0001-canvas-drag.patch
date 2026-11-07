@@ -1,0 +1,2003 @@
+diff --git a/niri-config/src/gestures.rs b/niri-config/src/gestures.rs
+index dcf296a..1a49ab7 100644
+--- a/niri-config/src/gestures.rs
++++ b/niri-config/src/gestures.rs
+@@ -6,6 +6,11 @@ pub struct Gestures {
+     pub dnd_edge_view_scroll: DndEdgeViewScroll,
+     pub dnd_edge_workspace_switch: DndEdgeWorkspaceSwitch,
+     pub hot_corners: HotCorners,
++    /// Matrix canvas: left-dragging on empty space pans the view in all
++    /// directions (2D pan across columns and workspaces).
++    pub canvas_drag: bool,
++    /// Legacy KDL name — pre-R105 configs say leinwand-drag; both work.
++    pub leinwand_drag: bool,
+ }
+ 
+ #[derive(knuffel::Decode, Debug, Default, Clone, Copy, PartialEq)]
+@@ -16,6 +21,10 @@ pub struct GesturesPart {
+     pub dnd_edge_workspace_switch: Option<DndEdgeWorkspaceSwitchPart>,
+     #[knuffel(child)]
+     pub hot_corners: Option<HotCorners>,
++    #[knuffel(child)]
++    pub canvas_drag: bool,
++    #[knuffel(child)]
++    pub leinwand_drag: bool,
+ }
+ 
+ impl MergeWith<GesturesPart> for Gestures {
+@@ -26,6 +35,8 @@ impl MergeWith<GesturesPart> for Gestures {
+             dnd_edge_workspace_switch,
+         );
+         merge_clone!((self, part), hot_corners);
++        self.leinwand_drag |= part.leinwand_drag;
++        self.canvas_drag |= part.canvas_drag || part.leinwand_drag;
+     }
+ }
+ 
+diff --git a/src/canvas.rs b/src/canvas.rs
+new file mode 100644
+index 0000000..2d1e68d
+--- /dev/null
++++ b/src/canvas.rs
+@@ -0,0 +1,142 @@
++//! Matrix canvas — the module home of the fork identity (R46).
++//!
++//! Decoupling step 2 (patch→modules): everything the canvas adds to
++//! upstream lives in its own files — here the empty-space rule and
++//! the window-ghost render hook; the input gestures sit in
++//! input/canvas.rs, the camera methods in layout/
++//! floating_canvas.rs. Upstream files keep only hook-in lines.
++
++use smithay::backend::renderer::element::Kind;
++use smithay::output::Output;
++use smithay::utils::{Logical, Point};
++
++use crate::niri::{Niri, PointContents};
++use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
++use crate::render_helpers::renderer::NiriRenderer;
++use crate::render_helpers::texture::TextureRenderElement;
++
++/// The empty-space rule of the canvas: no window, no hot corner, at
++/// most the WALLPAPER level (background layer) under the pointer —
++/// there gestures belong to the canvas, not to the apps.
++/// R199: bottom-layer surfaces are interactive citizens — the Raum
++/// scrim lives there, and wheel/finger in the gap between two bodies
++/// belongs to the Raum, not to canvas paging (finding: scrolling
++/// stopped whenever the pointer crossed a gap).
++pub fn empty_space(under: &PointContents) -> bool {
++    under.window.is_none()
++        && !under.hot_corner
++        && under.layer.as_ref().map_or(true, |l| {
++            matches!(
++                l.layer(),
++                smithay::wayland::shell::wlr_layer::Layer::Background
++            )
++        })
++}
++
++impl Niri {
++    /// Window ghost of the canvas: if the mouse rests on empty space,
++    /// the icon cloud of the open apps springs in next to it. Returns
++    /// the finished render element; None = nothing to show.
++    pub fn canvas_ghost_element<R: NiriRenderer>(
++        &self,
++        output: &Output,
++        renderer: &mut R,
++    ) -> Option<PrimaryGpuTextureRenderElement> {
++    // Matrix canvas: the window ghost — if the mouse rests on empty
++    // space, the icon cloud of the open apps springs in next to it
++    // (spatially like on the canvas; view center = larger icon).
++        if !self.config.borrow().gestures.canvas_drag {
++            return None;
++        }
++        let pointer = self.seat.get_pointer()?;
++        let ort = pointer.current_location();
++        let out_geo = self.global_space.output_geometry(output)?;
++        // The ghost lives only on the output under the pointer — only
++        // there may the visibility target be adjusted.
++        if !out_geo.to_f64().contains(ort) {
++            return None;
++        }
++
++        let mut window: Vec<(String, Point<f64, Logical>, bool)> = Vec::new();
++        let mut goal = self.pointer_visibility.is_visible()
++            && !self.layout.is_overview_open();
++        if goal {
++            let under = self.contents_under(ort);
++            goal = under.window.is_none()
++                && !under.hot_corner
++                && under.layer.as_ref().map_or(true, |l| {
++                    matches!(
++                        l.layer(),
++                        smithay::wayland::shell::wlr_layer::Layer::Background
++                            | smithay::wayland::shell::wlr_layer::Layer::Bottom
++                    )
++                });
++        }
++        if goal {
++            if let Some(mon) = self.layout.monitor_for_output(output) {
++                let info = mon.active_workspace_ref().canvas_ghost_info();
++                window = info
++                    .iter()
++                    .map(|(win, z, active)| {
++                        let app_id = win
++                            .toplevel()
++                            .and_then(|t| {
++                                crate::utils::with_toplevel_role(t, |role| {
++                                    role.app_id.clone()
++                                })
++                            })
++                            .unwrap_or_default();
++                        (app_id, *z, *active)
++                    })
++                    .collect();
++            }
++            goal = !window.is_empty();
++        }
++
++        // Ghost mode (user 2026-07-07): by default only visible after
++        // wheel paging — then it fades away again.
++        let goal = self.window_ghost.goal_show(goal) && goal;
++        self.window_ghost.set_target(goal);
++        let alpha = self.window_ghost.alpha();
++        if alpha <= 0.004 {
++            return None;
++        }
++
++        let scale = output.current_scale().fractional_scale();
++        let (buffer, position) = if goal {
++            let buffer = self.window_ghost.render(renderer, scale, &window)?;
++            // Next to the pointer, clamped into the screen (scroll-ghost
++            // grammar: right, flipping left at the edge).
++            let size = buffer.logical_size();
++            let local = ort - out_geo.loc.to_f64();
++            let out_size = out_geo.size.to_f64();
++            let mut x = local.x + 26.0;
++            let mut y = local.y + 26.0;
++            if x + size.w > out_size.w - 8.0 {
++                x = local.x - size.w - 26.0;
++            }
++            if y + size.h > out_size.h - 8.0 {
++                y = (out_size.h - size.h - 8.0).max(8.0);
++            }
++            self.window_ghost.note_down_ort(x, y);
++            (buffer, (x, y))
++        } else {
++            // Fading out: the last cloud fades in place.
++            let buffer = self.window_ghost.last_texture()?;
++            (buffer, self.window_ghost.last_ort())
++        };
++
++        let location = Point::from(position)
++            .to_physical_precise_round(scale)
++            .to_logical(scale);
++        let elem = TextureRenderElement::from_texture_buffer(
++            buffer,
++            location,
++            alpha as f32,
++            None,
++            None,
++            Kind::Unspecified,
++        );
++        Some(PrimaryGpuTextureRenderElement(elem))
++    }
++}
+diff --git a/src/input/canvas.rs b/src/input/canvas.rs
+new file mode 100644
+index 0000000..2f6b908
+--- /dev/null
++++ b/src/input/canvas.rs
+@@ -0,0 +1,280 @@
++//! Matrix canvas — the empty-space gestures (R46: lifted out of
++//! input/mod.rs). Mouse drag (2D pan), click-fetches, right-click menu,
++//! wheel/finger paging with sticky buffer, one-finger touch swipe.
++//! Kind-Modul from input — sieht dessen private Helfer.
++
++use smithay::backend::input::{AxisSource, MouseButton, TouchSlot};
++use smithay::input::pointer::{CursorIcon, CursorImageStatus, Focus, GrabStartData as PointerGrabStartData};
++use smithay::utils::{Logical, Point, Serial};
++
++use super::modifiers_from_state;
++use super::spatial_movement_grab::SpatialMovementGrab;
++use crate::canvas::empty_space;
++use crate::niri::{PointContents, State};
++
++/// Focus from outside (dock click, window ghost): the camera drives to
++/// the window — the same ride as the canvas click (task #33).
++pub fn focus_camera(state: &mut State, window: &smithay::desktop::Window) {
++    if state.niri.config.borrow().gestures.canvas_drag
++        && crate::utils::matrix_switch_on("canvas-klick-holt")
++        && state.niri.layout.canvas_window_show(window)
++    {
++        // FIXME: granular.
++        state.niri.queue_redraw_all();
++    }
++}
++
++/// Left-dragging on EMPTY SPACE pans the view in all directions —
++/// the desktop as an infinite canvas. true = grab set, event
++/// consumed. Activation: gestures { canvas-drag } in the config (legacy: leinwand-drag).
++pub fn drag_start(
++    state: &mut State,
++    button: Option<MouseButton>,
++    button_code: u32,
++    serial: Serial,
++    is_overview_open: bool,
++) -> bool {
++    if button != Some(MouseButton::Left) {
++        return false;
++    }
++    let pointer = state.niri.seat.get_pointer().unwrap();
++    if pointer.is_grabbed()
++        || is_overview_open
++        || !state.niri.config.borrow().gestures.canvas_drag
++    {
++        return false;
++    }
++    let location = pointer.current_location();
++    let under = state.niri.contents_under(location);
++    if !empty_space(&under) {
++        return false;
++    }
++    let output_ws = state.niri.output_under_cursor().and_then(|output| {
++        let mon = state.niri.layout.monitor_for_output(&output)?;
++        Some((output, mon.active_workspace_ref().id()))
++    });
++    let Some((output, ws_id)) = output_ws else {
++        return false;
++    };
++    state.niri.layout.focus_output(&output);
++    let start_data = PointerGrabStartData {
++        focus: None,
++        button: button_code,
++        location,
++    };
++    let grab = SpatialMovementGrab::new_canvas(start_data, output, ws_id);
++    pointer.set_grab(state, grab, serial, Focus::Clear);
++    state
++        .niri
++        .cursor_manager
++        .set_cursor_image(CursorImageStatus::Named(CursorIcon::AllScroll));
++    state.niri.queue_redraw_all();
++    true
++}
++
++/// Clicking a CLIPPED window drives it fully into view — fully
++/// visible windows stay calm so work clicks never yank the camera.
++///
++pub fn click_fetch(state: &mut State, is_overview_open: bool, mod_down: bool) {
++    let pointer = state.niri.seat.get_pointer().unwrap();
++    if is_overview_open
++        || mod_down
++        || pointer.is_grabbed()
++        || !state.niri.config.borrow().gestures.canvas_drag
++        || !crate::utils::matrix_switch_on("canvas-klick-holt")
++    {
++        return;
++    }
++    let window = state.niri.window_under_cursor().map(|m| m.window.clone());
++    if let Some(win) = window {
++        if state.niri.layout.canvas_window_show(&win) {
++            // FIXME: granular.
++            state.niri.queue_redraw_all();
++        }
++    }
++}
++
++/// Right click on EMPTY SPACE opens the desktop context menu
++/// (matrix-context) — the compositor only supplies place and occasion.
++/// Bar surfaces (dock/bar) do not count as empty space (finding 2026-07-08).
++pub fn right_click_context(
++    state: &mut State,
++    button: Option<MouseButton>,
++    is_overview_open: bool,
++    mod_down: bool,
++) {
++    let pointer = state.niri.seat.get_pointer().unwrap();
++    if button != Some(MouseButton::Right)
++        || is_overview_open
++        || mod_down
++        || pointer.is_grabbed()
++        || !state.niri.config.borrow().gestures.canvas_drag
++        || state.niri.window_under_cursor().is_some()
++    {
++        return;
++    }
++    let pos = pointer.current_location();
++    let on_panel = state.niri.output_under(pos).is_some_and(|(output, pos_in_out)| {
++        use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
++        let layers = smithay::desktop::layer_map_for_output(output);
++        [WlrLayer::Overlay, WlrLayer::Top, WlrLayer::Bottom]
++            .iter()
++            .any(|l| {
++                layers.layers_on(*l).any(|ls| {
++                    layers
++                        .layer_geometry(ls)
++                        .is_some_and(|g| g.to_f64().contains(pos_in_out))
++                })
++            })
++    });
++    if on_panel {
++        return;
++    }
++    crate::utils::spawning::spawn(
++        vec![
++            "sh".to_string(),
++            "-c".to_string(),
++            format!(
++                "PATH=$HOME/.local/bin:/usr/bin:$PATH exec matrix-context canvas {} {}",
++                pos.x as i32, pos.y as i32
++            ),
++        ],
++        None,
++    );
++}
++
++/// MOUSE WHEEL OR TRACKPAD on EMPTY SPACE pages through the windows —
++/// with a sticky buffer (1 s from the last tick, 24 px stillness).
++/// true = the event belongs to the canvas.
++pub fn wheel_paging(
++    state: &mut State,
++    source: AxisSource,
++    vertical_amount_v120: Option<f64>,
++    vertical_px: f64,
++    is_overview_open: bool,
++    is_mru_open: bool,
++) -> bool {
++    if !(source == AxisSource::Wheel || source == AxisSource::Finger)
++        || is_overview_open
++        || is_mru_open
++        || !state.niri.config.borrow().gestures.canvas_drag
++    {
++        return false;
++    }
++    let pointer = state.niri.seat.get_pointer().unwrap();
++    if pointer.is_grabbed() {
++        return false;
++    }
++    let mods = state.niri.seat.get_keyboard().unwrap().modifier_state();
++    if !modifiers_from_state(mods).is_empty() {
++        return false;
++    }
++    let location = pointer.current_location();
++    let under = state.niri.contents_under(location);
++    // Sticky buffer: after paging the camera centers — a window can
++    // slide under the STANDING mouse. As long as the pointer stands
++    // (almost) still and the last paging tick is less than a second
++    // old, the wheel keeps belonging to the canvas; every tick
++    // refreshes the deadline. (User flow finding, 2026-07-13.)
++    let sticky = state.niri.canvas_paging_last.is_some_and(|(time, ort)| {
++        time.elapsed().as_millis() < 1000 && {
++            let d = location - ort;
++            d.x * d.x + d.y * d.y <= 24.0 * 24.0
++        }
++    });
++    if !(empty_space(&under) || sticky) {
++        return false;
++    }
++    let ticks = if source == AxisSource::Wheel {
++        let vertical = vertical_amount_v120.unwrap_or(0.);
++        state.niri.vertical_wheel_tracker.accumulate(vertical)
++    } else {
++        state.niri.canvas_finger_roll += vertical_px;
++        let steps = (state.niri.canvas_finger_roll / 60.0).trunc() as i8;
++        if steps != 0 {
++            state.niri.canvas_finger_roll -= f64::from(steps) * 60.0;
++        }
++        steps
++    };
++    if ticks != 0 && crate::utils::matrix_switch_on("canvas-paging") {
++        let direction = if ticks > 0 { 1 } else { -1 };
++        for _ in 0..ticks.abs() {
++            if let Some(id) = state.niri.layout.canvas_paging(direction) {
++                state.niri.layout.activate_window(&id);
++            }
++        }
++        // The window ghost shows itself for paging.
++        state.niri.window_ghost.activate();
++        // Refresh the sticky deadline: 1 s from the LAST tick.
++        state.niri.canvas_paging_last =
++            Some((std::time::Instant::now(), location));
++        // FIXME: granular.
++        state.niri.queue_redraw_all();
++    }
++    true
++}
++
++/// A ONE-FINGER SWIPE on empty canvas space starts touch paging —
++/// the app below never sees a down. true = swipe taken over.
++pub fn swipe_start(
++    state: &mut State,
++    slot: TouchSlot,
++    pos: Point<f64, Logical>,
++    under: &PointContents,
++    mods_empty: bool,
++) -> bool {
++    let Some(handle) = state.niri.seat.get_touch() else {
++        return false;
++    };
++    if !state.niri.config.borrow().gestures.canvas_drag
++        || handle.is_grabbed()
++        || state.niri.canvas_swipe.is_some()
++        || state.niri.screenshot_ui.is_open()
++        || state.niri.window_mru_ui.is_open()
++        || state.niri.layout.is_overview_open()
++        || !mods_empty
++        || !empty_space(under)
++    {
++        return false;
++    }
++    state.niri.canvas_swipe = Some((slot, pos.y, 0.0));
++    true
++}
++
++/// Swipe end: pass nothing to the app. true = consumed.
++pub fn swipe_end(state: &mut State, slot: TouchSlot) -> bool {
++    if state.niri.canvas_swipe.is_some_and(|(wslot, ..)| wslot == slot) {
++        state.niri.canvas_swipe = None;
++        return true;
++    }
++    false
++}
++
++/// Running swipe: one paging step per 90 px. Finger UP = forward
++/// (phone logic). true = the motion belongs to the canvas.
++pub fn swipe_step(state: &mut State, slot: TouchSlot, pos: Point<f64, Logical>) -> bool {
++    let Some((wslot, last_y, collector)) = state.niri.canvas_swipe else {
++        return false;
++    };
++    if wslot != slot {
++        return false;
++    }
++    const THRESHOLD: f64 = 90.0;
++    let mut collector = collector + (pos.y - last_y);
++    let steps = (collector / THRESHOLD).trunc() as i32;
++    if steps != 0 {
++        collector -= f64::from(steps) * THRESHOLD;
++        if crate::utils::matrix_switch_on("canvas-paging") {
++            let direction = if steps > 0 { -1 } else { 1 };
++            for _ in 0..steps.unsigned_abs() {
++                if let Some(id) = state.niri.layout.canvas_paging(direction) {
++                    state.niri.layout.activate_window(&id);
++                }
++            }
++            state.niri.window_ghost.activate();
++            state.niri.queue_redraw_all();
++        }
++    }
++    state.niri.canvas_swipe = Some((wslot, pos.y, collector));
++    true
++}
+diff --git a/src/input/mod.rs b/src/input/mod.rs
+index 5056753..72eb456 100644
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -55,6 +55,7 @@ use crate::utils::spawning::{spawn, spawn_sh};
+ use crate::utils::{center, get_monotonic_time, CastSessionId, ResizeEdge};
+ 
+ pub mod backend_ext;
++pub(crate) mod canvas;
+ pub mod move_grab;
+ pub mod pick_color_grab;
+ pub mod pick_window_grab;
+@@ -874,6 +875,8 @@ impl State {
+                 let window = window.map(|(_, m)| m.window.clone());
+                 if let Some(window) = window {
+                     self.focus_window(&window);
++                    // Matrix canvas (R46): the camera rides along (input/canvas.rs).
++                    canvas::focus_camera(self, &window);
+                 }
+             }
+             Action::FocusWindowInColumn(index) => {
+@@ -2888,6 +2891,13 @@ impl State {
+                 }
+             }
+ 
++            // Matrix Leinwand (R46): Leerraum-Gesten wohnen in input/canvas.rs.
++            if canvas::drag_start(self, button, button_code, serial, is_overview_open) {
++                return;
++            }
++            canvas::click_fetch(self, is_overview_open, mod_down);
++            canvas::right_click_context(self, button, is_overview_open, mod_down);
++
+             if let Some(mapped) = self.niri.window_under_cursor() {
+                 let window = mapped.window.clone();
+ 
+@@ -3113,6 +3123,18 @@ impl State {
+ 
+         let is_mru_open = self.niri.window_mru_ui.is_open();
+ 
++        // Matrix canvas (R46): paging lives in input/canvas.rs.
++        if canvas::wheel_paging(
++            self,
++            source,
++            vertical_amount_v120,
++            event.amount(Axis::Vertical).unwrap_or(0.),
++            is_overview_open,
++            is_mru_open,
++        ) {
++            return;
++        }
++
+         // Handle wheel scroll bindings.
+         if source == AxisSource::Wheel {
+             // If we have a scroll bind with current modifiers, then accumulate and don't pass to
+@@ -4168,6 +4190,11 @@ impl State {
+         let mods = modifiers_from_state(mods);
+         let mod_down = mods.contains(mod_key.to_modifiers());
+ 
++        // Matrix Leinwand (R46): Touch-Wisch wohnt in input/canvas.rs.
++        if canvas::swipe_start(self, slot, pos, &under, mods.is_empty()) {
++            return;
++        }
++
+         if self.niri.screenshot_ui.is_open() {
+             // If we'll be moving the existing selection, use the selection output.
+             let output = if mod_down {
+@@ -4287,6 +4314,11 @@ impl State {
+         };
+         let slot = evt.slot();
+ 
++        // Matrix Leinwand (R46): input/canvas.rs.
++        if canvas::swipe_end(self, slot) {
++            return;
++        }
++
+         if let Some(capture) = self.niri.screenshot_ui.pointer_up(Some(slot)) {
+             if capture {
+                 self.confirm_screenshot(true);
+@@ -4314,6 +4346,11 @@ impl State {
+         };
+         let slot = evt.slot();
+ 
++        // Matrix Leinwand (R46): input/canvas.rs.
++        if canvas::swipe_step(self, slot, pos) {
++            return;
++        }
++
+         if let Some(output) = self.niri.screenshot_ui.selection_output().cloned() {
+             let geom = self.niri.global_space.output_geometry(&output).unwrap();
+             let point = (pos - geom.loc.to_f64())
+@@ -4353,6 +4390,7 @@ impl State {
+         handle.frame(self);
+     }
+     fn on_touch_cancel<I: InputBackend>(&mut self, _evt: I::TouchCancelEvent) {
++        self.niri.canvas_swipe = None;
+         let Some(handle) = self.niri.seat.get_touch() else {
+             return;
+         };
+diff --git a/src/input/spatial_movement_grab.rs b/src/input/spatial_movement_grab.rs
+index 546929a..7975067 100644
+--- a/src/input/spatial_movement_grab.rs
++++ b/src/input/spatial_movement_grab.rs
+@@ -25,6 +25,9 @@ pub struct SpatialMovementGrab {
+     new_location: Point<f64, Logical>,
+     event_timestamp: Option<Duration>,
+     relative_delta: Option<Point<f64, Logical>>,
++
++    // Matrix canvas: total travel (click without drag = homeward).
++    dist_sq: f64,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -32,6 +35,9 @@ enum GestureState {
+     Recognizing,
+     ViewOffset,
+     WorkspaceSwitch,
++    /// Matrix canvas: free 2D pan of the floating layer (both axes
++    /// simultaneously — no axis snapping).
++    Canvas,
+ }
+ 
+ impl SpatialMovementGrab {
+@@ -57,6 +63,27 @@ impl SpatialMovementGrab {
+             new_location: location,
+             event_timestamp: None,
+             relative_delta: None,
++            dist_sq: 0.,
++        }
++    }
++
++    /// Matrix canvas: grab that moves the floating camera freely in 2D.
++    pub fn new_canvas(
++        start_data: PointerGrabStartData<State>,
++        output: Output,
++        workspace_id: WorkspaceId,
++    ) -> Self {
++        let location = start_data.location;
++        Self {
++            last_location: location,
++            start_data,
++            output,
++            workspace_id,
++            gesture: GestureState::Canvas,
++            new_location: location,
++            event_timestamp: None,
++            relative_delta: None,
++            dist_sq: 0.,
+         }
+     }
+ 
+@@ -113,6 +140,11 @@ impl SpatialMovementGrab {
+             GestureState::WorkspaceSwitch => {
+                 layout.workspace_switch_gesture_update(-delta.y, timestamp, false)
+             }
++            GestureState::Canvas => {
++                self.dist_sq += delta.x * delta.x + delta.y * delta.y;
++                layout.canvas_pan(delta);
++                Some(Some(self.output.clone()))
++            }
+         };
+ 
+         if let Some(output) = res {
+@@ -131,6 +163,15 @@ impl SpatialMovementGrab {
+             GestureState::Recognizing => None,
+             GestureState::ViewOffset => layout.view_offset_gesture_end(Some(false)),
+             GestureState::WorkspaceSwitch => layout.workspace_switch_gesture_end(Some(false)),
++            GestureState::Canvas => {
++                // Click on empty space without meaningful drag: homeward.
++                if self.dist_sq < 6.0 * 6.0 {
++                    if crate::utils::matrix_switch_on("canvas-homeward") {
++                    layout.canvas_homeward();
++                    }
++                }
++                Some(self.output.clone())
++            }
+         };
+ 
+         if let Some(output) = res {
+diff --git a/src/layout/floating.rs b/src/layout/floating.rs
+index 075787f..949e9fd 100644
+--- a/src/layout/floating.rs
++++ b/src/layout/floating.rs
+@@ -27,6 +27,10 @@ use crate::utils::{
+ };
+ use crate::window::ResolvedWindowRules;
+ 
++// Matrix canvas (R46): camera & order live in the child module.
++#[path = "floating_canvas.rs"]
++mod canvas_teil;
++
+ /// By how many logical pixels the directional move commands move floating windows.
+ pub const DIRECTIONAL_MOVE_PX: f64 = 50.;
+ 
+@@ -67,6 +71,9 @@ pub struct FloatingSpace<W: LayoutElement> {
+ 
+     /// Configurable properties of the layout.
+     options: Rc<Options>,
++
++    /// Matrix canvas: the camera — viewpoint on the infinite plane.
++    view: Point<f64, Logical>,
+ }
+ 
+ niri_render_elements! {
+@@ -92,6 +99,9 @@ struct Data {
+ 
+     /// Working area used for conversions.
+     working_area: Rectangle<f64, Logical>,
++
++    /// Matrix canvas: absolute plane coordinates, no clamping.
++    canvas: bool,
+ }
+ 
+ impl Data {
+@@ -99,18 +109,32 @@ impl Data {
+         working_area: Rectangle<f64, Logical>,
+         tile: &Tile<W>,
+         logical_pos: Point<f64, Logical>,
++        canvas: bool,
+     ) -> Self {
+         let mut rv = Self {
+             pos: Point::default(),
+             logical_pos: Point::default(),
+             size: Size::default(),
+             working_area,
++            canvas,
+         };
+         rv.update(tile);
+         rv.set_logical_pos(logical_pos);
+         rv
+     }
+ 
++    /// Toggle canvas mode; on switching off the position clamps back
++    /// into the workspace.
++    pub fn set_canvas(&mut self, canvas: bool) {
++        if self.canvas == canvas {
++            return;
++        }
++        self.canvas = canvas;
++        if !canvas {
++            self.set_logical_pos(self.logical_pos);
++        }
++    }
++
+     pub fn scale_by_working_area(
+         area: Rectangle<f64, Logical>,
+         pos: Point<f64, SizeFrac>,
+@@ -134,6 +158,11 @@ impl Data {
+     }
+ 
+     fn recompute_logical_pos(&mut self) {
++        // Matrix canvas: positions are absolute plane coordinates —
++        // no derivation from the workspace, no clamping.
++        if self.canvas {
++            return;
++        }
+         let mut logical_pos = Self::scale_by_working_area(self.working_area, self.pos);
+ 
+         // Make sure the window doesn't go too much off-screen. Numbers taken from Mutter.
+@@ -180,6 +209,10 @@ impl Data {
+     pub fn set_logical_pos(&mut self, logical_pos: Point<f64, Logical>) {
+         self.pos = Self::logical_to_size_frac_in_working_area(self.working_area, logical_pos);
+ 
++        if self.canvas {
++            self.logical_pos = logical_pos;
++            return;
++        }
+         // This will clamp the logical position to the current working area.
+         self.recompute_logical_pos();
+     }
+@@ -218,6 +251,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
+             scale,
+             clock,
+             options,
++            view: Point::default(),
+         }
+     }
+ 
+@@ -228,8 +262,10 @@ impl<W: LayoutElement> FloatingSpace<W> {
+         scale: f64,
+         options: Rc<Options>,
+     ) {
++        let canvas = options.gestures.canvas_drag;
+         for (tile, data) in zip(&mut self.tiles, &mut self.data) {
+             tile.update_config(view_size, scale, options.clone());
++            data.set_canvas(canvas);
+             data.update(tile);
+             data.update_config(working_area);
+         }
+@@ -286,14 +322,16 @@ impl<W: LayoutElement> FloatingSpace<W> {
+     }
+ 
+     pub fn tiles_with_offsets(&self) -> impl Iterator<Item = (&Tile<W>, Point<f64, Logical>)> + '_ {
+-        let offsets = self.data.iter().map(|d| d.logical_pos);
++        let view = if self.canvas() { self.view } else { Point::default() };
++        let offsets = self.data.iter().map(move |d| d.logical_pos - view);
+         zip(&self.tiles, offsets)
+     }
+ 
+     pub fn tiles_with_offsets_mut(
+         &mut self,
+     ) -> impl Iterator<Item = (&mut Tile<W>, Point<f64, Logical>)> + '_ {
+-        let offsets = self.data.iter().map(|d| d.logical_pos);
++        let view = if self.canvas() { self.view } else { Point::default() };
++        let offsets = self.data.iter().map(move |d| d.logical_pos - view);
+         zip(&mut self.tiles, offsets)
+     }
+ 
+@@ -447,14 +485,19 @@ impl<W: LayoutElement> FloatingSpace<W> {
+         }
+ 
+         let pos = self.stored_or_default_tile_pos(&tile).unwrap_or_else(|| {
+-            center_preferring_top_left_in_area(self.working_area, tile.tile_size())
++            if self.canvas() {
++                self.canvas_spawn_pos(tile.tile_size())
++            } else {
++                center_preferring_top_left_in_area(self.working_area, tile.tile_size())
++            }
+         });
+ 
+-        let data = Data::new(self.working_area, &tile, pos);
++        let data = Data::new(self.working_area, &tile, pos, self.canvas());
+         self.data.insert(idx, data);
+         self.tiles.insert(idx, tile);
+ 
+         self.bring_up_descendants_of(idx);
++        self.canvas_deoverlap(idx);
+     }
+ 
+     pub fn add_tile_above(&mut self, above: &W::Id, mut tile: Tile<W>, activate: bool) {
+@@ -1053,6 +1096,13 @@ impl<W: LayoutElement> FloatingSpace<W> {
+             data.set_logical_pos(data.logical_pos + offset);
+         }
+ 
++        // Canvas: neighbors get used to the new size. Runs on EVERY
++        // commit (cheap without overlap) — at spawn windows only know
++        // their real size after the first commit, and only then can
++        // legacy overlaps be resolved safely.
++        self.canvas_deoverlap(tile_idx);
++        let _ = prev_size;
++
+         true
+     }
+ 
+diff --git a/src/layout/floating_canvas.rs b/src/layout/floating_canvas.rs
+new file mode 100644
+index 0000000..f93c9f7
+--- /dev/null
++++ b/src/layout/floating_canvas.rs
+@@ -0,0 +1,255 @@
++//! Matrix canvas — camera (peek), paging, homeward, ghost info,
++//! spawn order and de-overlap of the FloatingSpace (R46: lifted out
++//! of floating.rs; child module, sees the private fields).
++
++use super::*;
++
++impl<W: LayoutElement> FloatingSpace<W> {
++    /// Leinwand-Modus aktiv? (Config: gestures { canvas-drag })
++    pub(super) fn canvas(&self) -> bool {
++        self.options.gestures.canvas_drag
++    }
++
++    /// Move the camera: the plane follows the cursor (grab the paper).
++    pub fn canvas_pan(&mut self, delta: Point<f64, Logical>) {
++        if self.canvas() {
++            self.view -= delta;
++        }
++    }
++
++    /// Homeward: set the camera so the centroid of all windows sits
++    /// centered in the workspace — against getting lost on the infinite
++    /// plane. (The call springs via tiles_with_render_positions.)
++    pub fn canvas_homeward(&mut self) {
++        if !self.canvas() || self.data.is_empty() {
++            return;
++        }
++        let mut center = Point::from((0.0, 0.0));
++        for d in &self.data {
++            center += d.logical_pos + d.size.downscale(2.0).to_point();
++        }
++        let n = self.data.len() as f64;
++        center = Point::from((center.x / n, center.y / n));
++        let target = self.working_area.loc + self.working_area.size.downscale(2.0).to_point();
++        self.view = center - target;
++    }
++
++    /// Fenster-Geist (Matrix-Original, 7.7.): Zentren aller Leinwand-
++    /// Windows + marker of the window closest to the view center —
++    /// the basis of the icon cloud next to the mouse.
++    pub fn canvas_ghost_info(&self) -> Vec<(W::Id, Point<f64, Logical>, bool)> {
++        if !self.canvas() || self.data.is_empty() {
++            return Vec::new();
++        }
++        let view_center =
++            self.working_area.loc + self.working_area.size.downscale(2.0).to_point() + self.view;
++        let centers: Vec<Point<f64, Logical>> = self
++            .data
++            .iter()
++            .map(|d| d.logical_pos + d.size.downscale(2.0).to_point())
++            .collect();
++        let next_pt = (0..centers.len()).min_by(|&a, &b| {
++            let da = centers[a] - view_center;
++            let db = centers[b] - view_center;
++            (da.x * da.x + da.y * da.y).total_cmp(&(db.x * db.x + db.y * db.y))
++        });
++        self.tiles
++            .iter()
++            .zip(centers)
++            .enumerate()
++            .map(|(i, (tile, z))| (tile.window().id().clone(), z, Some(i) == next_pt))
++            .collect()
++    }
++
++    /// Canvas paging (user idea 2026-07-07): the mouse wheel on empty
++    /// space wanders through the windows — spatially sorted (left→right,
++    /// ties top→bottom). The camera centers the chosen window (making it
++    /// fully visible), the ride springs like a magic move.
++    /// Returns the window that shall receive focus.
++    pub fn canvas_paging(&mut self, direction: i32) -> Option<W::Id> {
++        if !self.canvas() || self.data.is_empty() {
++            return None;
++        }
++        let centers: Vec<Point<f64, Logical>> = self
++            .data
++            .iter()
++            .map(|d| d.logical_pos + d.size.downscale(2.0).to_point())
++            .collect();
++        let mut ordering: Vec<usize> = (0..centers.len()).collect();
++        ordering.sort_by(|&a, &b| {
++            centers[a]
++                .x
++                .total_cmp(&centers[b].x)
++                .then(centers[a].y.total_cmp(&centers[b].y))
++        });
++        // "Current" = the window whose center is closest to the view
++        // center — what the eye currently takes for front.
++        let view_center =
++            self.working_area.loc + self.working_area.size.downscale(2.0).to_point() + self.view;
++        let next_one = (0..centers.len()).min_by(|&a, &b| {
++            let da = centers[a] - view_center;
++            let db = centers[b] - view_center;
++            (da.x * da.x + da.y * da.y).total_cmp(&(db.x * db.x + db.y * db.y))
++        })?;
++        let pos = ordering.iter().position(|&i| i == next_one)? as i64;
++        let n = ordering.len() as i64;
++        let target = ordering[(pos + direction as i64).rem_euclid(n) as usize];
++
++        // Center the camera on the target — fully visible as long as the
++        // window fits the screen; the tiles spring over from the old view.
++        let alt = self.view;
++        self.view = centers[target]
++            - (self.working_area.loc + self.working_area.size.downscale(2.0).to_point());
++        let diff = self.view - alt;
++        if diff.x * diff.x + diff.y * diff.y > 4.0 {
++            for tile in &mut self.tiles {
++                tile.animate_move_from(diff);
++            }
++        }
++        Some(self.tiles[target].window().id().clone())
++    }
++
++    /// Window click on the canvas (user idea 2026-07-07): a NOT fully
++    /// visible window drives fully into view when clicked — like wheel
++    /// paging. Fully visible windows stay calm so work clicks (buttons,
++    /// text) never yank the camera.
++    /// Returns true if the camera moved.
++    pub fn canvas_window_show(&mut self, id: &W::Id) -> bool {
++        if !self.canvas() {
++            return false;
++        }
++        let Some(i) = self.tiles.iter().position(|t| t.window().id() == id) else {
++            return false;
++        };
++        let window = Rectangle::new(self.data[i].logical_pos, self.data[i].size);
++        let view = Rectangle::new(self.working_area.loc + self.view, self.working_area.size);
++        // Tolerance: 2px of rounding air still counts as "fully visible".
++        let air = 2.0;
++        let inside = window.loc.x >= view.loc.x - air
++            && window.loc.y >= view.loc.y - air
++            && window.loc.x + window.size.w <= view.loc.x + view.size.w + air
++            && window.loc.y + window.size.h <= view.loc.y + view.size.h + air;
++        if inside {
++            return false;
++        }
++        let alt = self.view;
++        let center_pt = window.loc + window.size.downscale(2.0).to_point();
++        self.view =
++            center_pt - (self.working_area.loc + self.working_area.size.downscale(2.0).to_point());
++        let diff = self.view - alt;
++        if diff.x * diff.x + diff.y * diff.y > 4.0 {
++            for tile in &mut self.tiles {
++                tile.animate_move_from(diff);
++            }
++        }
++        true
++    }
++
++    /// Canvas spawn: a free spot near the current view — windows open
++    /// SIDE BY SIDE, never overlapping (ring search around the center).
++    pub(super) fn canvas_spawn_pos(&self, size: Size<f64, Logical>) -> Point<f64, Logical> {
++        let basis = center_preferring_top_left_in_area(self.working_area, size) + self.view;
++        let free = |p: Point<f64, Logical>| {
++            let candidate = Rectangle::new(p, size);
++            !self
++                .data
++                .iter()
++                .any(|d| candidate.overlaps(Rectangle::new(d.logical_pos, d.size)))
++        };
++        if free(basis) {
++            return basis;
++        }
++        let step = 64.0;
++        for ring in 1..=16 {
++            let r = ring as f64 * step;
++            for (dx, dy) in [
++                (r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r),
++                (r, r), (-r, r), (r, -r), (-r, -r),
++            ] {
++                let p = basis + Point::from((dx, dy));
++                if free(p) {
++                    return p;
++                }
++            }
++        }
++        basis
++    }
++
++    /// Canvas rule: windows NEVER overlap. The originator (e.g. the
++    /// enlarged or dropped window) stays put — overlapped neighbors yield
++    /// along the smallest separation axis, cascading, until calm reigns
++    /// (user feedback 2026-07-07: "windows do not get used to the new
++    /// size").
++    pub(super) fn canvas_deoverlap(&mut self, fest: usize) {
++        if !self.canvas() || self.data.len() < 2 {
++            return;
++        }
++        const AIR: f64 = 16.0;
++        for _ in 0..64 {
++            let mut moved = false;
++            for i in 0..self.data.len() {
++                for j in 0..self.data.len() {
++                    if i == j || j == fest {
++                        continue;
++                    }
++                    // For non-originator pairs check only one direction,
++                    // else i and j push each other endlessly.
++                    if i != fest && i > j {
++                        continue;
++                    }
++                    let a = Rectangle::new(self.data[i].logical_pos, self.data[i].size);
++                    let b = Rectangle::new(self.data[j].logical_pos, self.data[j].size);
++                    if !a.overlaps(b) {
++                        continue;
++                    }
++                    // R57 (user finding): if a window lies COMPLETELY inside the
++                    // other, that is INTENDED (Matrix Web's docking coupling lays
++                    // the WebKit carrier congruently under the chrome). Such pairs
++                    // are left alone by the de-overlap — otherwise coupling and
++                    // order fight endlessly (that was the glitching of the white
++                    // window).
++                    let encloses = |outer: Rectangle<f64, Logical>,
++                                       inner: Rectangle<f64, Logical>| {
++                        let air = 4.0;
++                        inner.loc.x >= outer.loc.x - air
++                            && inner.loc.y >= outer.loc.y - air
++                            && inner.loc.x + inner.size.w
++                                <= outer.loc.x + outer.size.w + air
++                            && inner.loc.y + inner.size.h
++                                <= outer.loc.y + outer.size.h + air
++                    };
++                    if encloses(a, b) || encloses(b, a) {
++                        continue;
++                    }
++                    // Smallest separation axis: j yields to i.
++                    let after_right = a.loc.x + a.size.w - b.loc.x + AIR;
++                    let leftward = b.loc.x + b.size.w - a.loc.x + AIR;
++                    let after_bottom = a.loc.y + a.size.h - b.loc.y + AIR;
++                    let after_top = b.loc.y + b.size.h - a.loc.y + AIR;
++                    let min = after_right.min(leftward).min(after_bottom).min(after_top);
++                    let offset = if min == after_right {
++                        Point::from((after_right, 0.0))
++                    } else if min == leftward {
++                        Point::from((-leftward, 0.0))
++                    } else if min == after_bottom {
++                        Point::from((0.0, after_bottom))
++                    } else {
++                        Point::from((0.0, -after_top))
++                    };
++                    let before = self.data[j].logical_pos;
++                    let fresh = before + offset;
++                    self.data[j].set_logical_pos(fresh);
++                    // Springy yielding (magic move) instead of jumping.
++                    let diff = before - self.data[j].logical_pos;
++                    if diff.x * diff.x + diff.y * diff.y > 4.0 {
++                        self.tiles[j].animate_move_from(diff);
++                    }
++                    moved = true;
++                }
++            }
++            if !moved {
++                break;
++            }
++        }
++    }
++}
+diff --git a/src/layout/mod.rs b/src/layout/mod.rs
+index 5c4dd63..eaaa0a6 100644
+--- a/src/layout/mod.rs
++++ b/src/layout/mod.rs
+@@ -1610,6 +1610,34 @@ impl<W: LayoutElement> Layout<W> {
+         Some(&mon.workspaces[mon.active_workspace_idx])
+     }
+ 
++    /// Matrix canvas: move the camera of the active floating layer.
++    pub fn canvas_pan(&mut self, delta: Point<f64, Logical>) {
++        if let Some(ws) = self.active_workspace_mut() {
++            ws.canvas_pan(delta);
++        }
++    }
++
++    /// Matrix canvas: camera homeward to the window centroid.
++    pub fn canvas_homeward(&mut self) {
++        if let Some(ws) = self.active_workspace_mut() {
++            ws.canvas_homeward();
++        }
++    }
++
++    /// Matrix canvas: wheel to the next/previous window — returns the
++    /// window to focus.
++    pub fn canvas_paging(&mut self, direction: i32) -> Option<W::Id> {
++        let ws = self.active_workspace_mut()?;
++        ws.canvas_paging(direction)
++    }
++
++    /// Matrix canvas: drive the clicked window fully into view
++    /// (only if it is not already fully visible).
++    pub fn canvas_window_show(&mut self, id: &W::Id) -> bool {
++        self.active_workspace_mut()
++            .is_some_and(|ws| ws.canvas_window_show(id))
++    }
++
+     pub fn active_workspace_mut(&mut self) -> Option<&mut Workspace<W>> {
+         let MonitorSet::Normal {
+             monitors,
+diff --git a/src/layout/scrolling.rs b/src/layout/scrolling.rs
+index 9739abd..0952ab2 100644
+--- a/src/layout/scrolling.rs
++++ b/src/layout/scrolling.rs
+@@ -554,7 +554,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         }
+ 
+         let (area, padding) = if mode.is_maximized() {
+-            (self.parent_area, 0.)
++            (self.maximized_area(), 0.)
+         } else {
+             (self.working_area, self.options.layout.gaps)
+         };
+@@ -580,7 +580,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         }
+ 
+         let area = if mode.is_maximized() {
+-            self.parent_area
++            self.maximized_area()
+         } else {
+             self.working_area
+         };
+@@ -3212,7 +3212,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+                 let mode = col.sizing_mode();
+ 
+                 let area = if mode.is_maximized() {
+-                    self.parent_area
++                    self.maximized_area()
+                 } else {
+                     self.working_area
+                 };
+@@ -3245,7 +3245,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+                     let mode = col.sizing_mode();
+ 
+                     let area = if mode.is_maximized() {
+-                        self.parent_area
++                        self.maximized_area()
+                     } else {
+                         self.working_area
+                     };
+@@ -3399,7 +3399,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+                     let mode = col.sizing_mode();
+ 
+                     let area = if mode.is_maximized() {
+-                        self.parent_area
++                        self.maximized_area()
+                     } else {
+                         self.working_area
+                     };
+@@ -3433,7 +3433,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+                     let mode = col.sizing_mode();
+ 
+                     let area = if mode.is_maximized() {
+-                        self.parent_area
++                        self.maximized_area()
+                     } else {
+                         self.working_area
+                     };
+@@ -3723,6 +3723,20 @@ impl<W: LayoutElement> ScrollingSpace<W> {
+         self.parent_area
+     }
+ 
++    /// Canvas: the area for maximized windows — the workspace minus the
++    /// one air (gaps), so maximized keeps the same edge distance as bar,
++    /// dock and full columns.
++    fn maximized_area(&self) -> Rectangle<f64, Logical> {
++        let gaps = self.options.layout.gaps;
++        let mut area = self.parent_area;
++        area.loc.x += gaps;
++        area.loc.y += gaps;
++        area.size.w = f64::max(1., area.size.w - gaps * 2.);
++        area.size.h = f64::max(1., area.size.h - gaps * 2.);
++        area
++    }
++
++
+     #[cfg(test)]
+     pub fn clock(&self) -> &Clock {
+         &self.clock
+@@ -4418,6 +4432,7 @@ impl<W: LayoutElement> Column<W> {
+     fn update_tile_sizes_with_transaction(&mut self, animate: bool, transaction: Transaction) {
+         let sizing_mode = self.pending_sizing_mode();
+         if matches!(sizing_mode, SizingMode::Fullscreen | SizingMode::Maximized) {
++            let max_size = self.maximized_area().size;
+             for (tile_idx, tile) in self.tiles.iter_mut().enumerate() {
+                 // In tabbed mode, only the visible window participates in the transaction.
+                 let is_active = tile_idx == self.active_tile_idx;
+@@ -4430,7 +4445,7 @@ impl<W: LayoutElement> Column<W> {
+                 if matches!(sizing_mode, SizingMode::Fullscreen) {
+                     tile.request_fullscreen(animate, transaction);
+                 } else {
+-                    tile.request_maximized(self.parent_area.size, animate, transaction);
++                    tile.request_maximized(max_size, animate, transaction);
+                 }
+             }
+             return;
+@@ -5166,13 +5181,26 @@ impl<W: LayoutElement> Column<W> {
+         self.update_tile_sizes(true);
+     }
+ 
++    /// Canvas: the area for maximized windows — the workspace minus the
++    /// one air (gaps), so maximized keeps the same edge distance as bar,
++    /// dock and full columns.
++    fn maximized_area(&self) -> Rectangle<f64, Logical> {
++        let gaps = self.options.layout.gaps;
++        let mut area = self.parent_area;
++        area.loc.x += gaps;
++        area.loc.y += gaps;
++        area.size.w = f64::max(1., area.size.w - gaps * 2.);
++        area.size.h = f64::max(1., area.size.h - gaps * 2.);
++        area
++    }
++
+     fn tiles_origin(&self) -> Point<f64, Logical> {
+         let mut origin = Point::from((0., 0.));
+ 
+         match self.sizing_mode() {
+             SizingMode::Normal => (),
+             SizingMode::Maximized => {
+-                origin.y += self.parent_area.loc.y;
++                origin.y += self.maximized_area().loc.y;
+                 return origin;
+             }
+             SizingMode::Fullscreen => return origin,
+diff --git a/src/layout/workspace.rs b/src/layout/workspace.rs
+index 7448779..217db4c 100644
+--- a/src/layout/workspace.rs
++++ b/src/layout/workspace.rs
+@@ -206,6 +206,31 @@ impl FloatingActive {
+ }
+ 
+ impl<W: LayoutElement> Workspace<W> {
++    /// Matrix canvas: move the camera of the floating layer.
++    pub fn canvas_pan(&mut self, delta: Point<f64, Logical>) {
++        self.floating.canvas_pan(delta);
++    }
++
++    /// Matrix canvas: camera homeward to the window centroid.
++    pub fn canvas_homeward(&mut self) {
++        self.floating.canvas_homeward();
++    }
++
++    /// Matrix canvas: wheel to the next/previous window.
++    pub fn canvas_paging(&mut self, direction: i32) -> Option<W::Id> {
++        self.floating.canvas_paging(direction)
++    }
++
++    /// Window ghost: window centers for the icon cloud next to the mouse.
++    pub fn canvas_ghost_info(&self) -> Vec<(W::Id, Point<f64, Logical>, bool)> {
++        self.floating.canvas_ghost_info()
++    }
++
++    /// Matrix canvas: drive the clicked window fully into view.
++    pub fn canvas_window_show(&mut self, id: &W::Id) -> bool {
++        self.floating.canvas_window_show(id)
++    }
++
+     pub fn new(output: Output, clock: Clock, options: Rc<Options>) -> Self {
+         Self::new_with_config(output, None, clock, options)
+     }
+diff --git a/src/lib.rs b/src/lib.rs
+index d516838..fa435e5 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -15,6 +15,7 @@ pub mod input;
+ pub mod ipc;
+ pub mod layer;
+ pub mod layout;
++pub mod canvas;
+ pub mod niri;
+ pub mod protocols;
+ pub mod render_helpers;
+diff --git a/src/niri.rs b/src/niri.rs
+index 3d60544..61098e8 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -168,6 +168,7 @@ use crate::render_helpers::{
+ use crate::screencasting::Screencasting;
+ use crate::ui::config_error_notification::ConfigErrorNotification;
+ use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
++use crate::ui::window_ghost::WindowGhost;
+ use crate::ui::hotkey_overlay::HotkeyOverlay;
+ use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
+ use crate::ui::screen_transition::{self, ScreenTransition};
+@@ -390,6 +391,18 @@ pub struct Niri {
+     pub config_error_notification: ConfigErrorNotification,
+     pub hotkey_overlay: HotkeyOverlay,
+     pub exit_confirm_dialog: ExitConfirmDialog,
++    /// Window ghost of the canvas: icon cloud of the open apps at the mouse.
++    pub window_ghost: WindowGhost,
++    /// Canvas paging via trackpad: accumulated scroll pixels
++    /// (one step per 60 px; the wheel uses the v120 tracker).
++    pub canvas_finger_roll: f64,
++    /// Sticky paging: time and pointer place of the last canvas paging.
++    /// If a window slides under the STANDING mouse while the camera
++    /// centers, the wheel belongs to the canvas for another 1 s
++    pub canvas_paging_last: Option<(std::time::Instant, Point<f64, Logical>)>,
++    /// Touch swipe on empty canvas: (slot, last Y, pixel accumulator).
++    /// One-finger counterpart of wheel paging (user, 2026-07-13).
++    pub canvas_swipe: Option<(smithay::backend::input::TouchSlot, f64, f64)>,
+ 
+     pub window_mru_ui: WindowMruUi,
+     pub pending_mru_commit: Option<PendingMruCommit>,
+@@ -2423,6 +2436,7 @@ impl Niri {
+         let config_error_notification =
+             ConfigErrorNotification::new(animation_clock.clone(), config.clone());
+ 
++        let window_ghost = WindowGhost::new(animation_clock.clone(), config.clone());
+         let mut hotkey_overlay = HotkeyOverlay::new(config.clone(), mod_key);
+         if !config_.hotkey_overlay.skip_at_startup {
+             hotkey_overlay.show();
+@@ -2611,6 +2625,10 @@ impl Niri {
+             screenshot_ui,
+             config_error_notification,
+             hotkey_overlay,
++            window_ghost,
++            canvas_finger_roll: 0.0,
++            canvas_paging_last: None,
++            canvas_swipe: None,
+             exit_confirm_dialog,
+ 
+             window_mru_ui,
+@@ -4067,6 +4085,7 @@ impl Niri {
+ 
+         self.layout.advance_animations();
+         self.config_error_notification.advance_animations();
++        self.window_ghost.advance_animations();
+         self.exit_confirm_dialog.advance_animations();
+         self.screenshot_ui.advance_animations();
+         self.window_mru_ui.advance_animations();
+@@ -4299,6 +4318,12 @@ impl Niri {
+         self.window_mru_ui
+             .render_output(self, output, ctx.r(), &mut |elem| push(elem.into()));
+ 
++        // Matrix canvas (R46): the window ghost lives in
++        // crate::canvas — here only the hook-in point.
++        if let Some(elem) = self.canvas_ghost_element(output, ctx.renderer) {
++            push(elem.into());
++        }
++
+         // Don't draw the focus ring on the workspaces while interactively moving above those
+         // workspaces, since the interactively-moved window already has a focus ring.
+         let focus_ring = !self.layout.interactive_move_is_moving_above_output(output);
+@@ -4612,6 +4637,7 @@ impl Niri {
+             state.unfinished_animations_remain |=
+                 self.config_error_notification.are_animations_ongoing();
+             state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
++            state.unfinished_animations_remain |= self.window_ghost.are_animations_ongoing();
+             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
+             state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
+             state.unfinished_animations_remain |= state.screen_transition.is_some();
+diff --git a/src/ui/mod.rs b/src/ui/mod.rs
+index c194a24..4d62ef6 100644
+--- a/src/ui/mod.rs
++++ b/src/ui/mod.rs
+@@ -1,5 +1,6 @@
+ pub mod config_error_notification;
+ pub mod exit_confirm_dialog;
++pub mod window_ghost;
+ pub mod hotkey_overlay;
+ pub mod mru;
+ pub mod screen_transition;
+diff --git a/src/ui/window_ghost.rs b/src/ui/window_ghost.rs
+new file mode 100644
+index 0000000..907cf5e
+--- /dev/null
++++ b/src/ui/window_ghost.rs
+@@ -0,0 +1,599 @@
++//! The window ghost (Matrix original, 2026-07-07).
++//!
++//! On the infinite canvas there is no overview of the open windows —
++//! the window ghost shows it: if the mouse rests on empty space, a
++//! small icon cloud of all open apps fades in next to it, arranged
++//! spatially like the windows on the canvas (a miniature map of app
++//! icons). The window of the view center is simply LARGER than the
++//! others and carries a same-shaped squircle edge.
++//! Related to the scroll ghost of the MatrixKit apps: orientation
++//! appears at the mouse, not at the edge — and springs in and out.
++//!
++//! GEISTKIT RULE: the ghosts belong to MatrixKit and obey its laws —
++//! colors come from the living DMS palette (light and dark), the
++//! radii are concentric, the font is Inter, and "reduce motion"
++//! (~/.config/matrix/motion) switches the spring off.
++//! Nothing that keeps the system alive is hardcoded.
++
++use std::cell::{Cell, RefCell};
++use std::collections::HashMap;
++use std::hash::{Hash, Hasher};
++use std::path::PathBuf;
++use std::rc::Rc;
++
++use niri_config::Config;
++use pangocairo::cairo::{self, Format, ImageSurface};
++use pangocairo::pango::{self, FontDescription};
++use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
++use smithay::utils::{Logical, Point, Transform};
++
++use crate::animation::{Animation, Clock};
++use crate::render_helpers::renderer::NiriRenderer;
++use crate::render_helpers::texture::TextureBuffer;
++
++/// Logical size of an icon in the cloud.
++const ICON: f64 = 24.0;
++/// The window of the view center: simply larger instead of ringed.
++const ACTIVE: f64 = 34.0;
++/// Maximum extent of the center cluster (without padding).
++/// Window ghost 3.0 (user design): no map projection anymore —
++/// a calm LIST, at most three icons stacked, the active one in
++/// the middle. Paging shifts the row with wraparound.
++const LIST_MAX: usize = 3;
++const LIST_CADENCE: f64 = ACTIVE + 10.0;
++const PADDING: f64 = 12.0;
++/// Mindestabstand zweier Icon-Zentren (Entzerrung naher Fenster).
++
++/// Squircle radius of the icon tiles — the same curve as the
++/// MatrixKit app icons (~28 % of the edge length).
++fn corner(gr: f64) -> f64 {
++    gr * 0.28
++}
++
++/// The living MatrixKit palette, as far as the ghost needs it
++/// (GeistKit rule: no hardcoded colors).
++struct GhostPalette {
++    panel: (f64, f64, f64),
++    edge: (f64, f64, f64),
++    active: (f64, f64, f64),
++    tile: (f64, f64, f64),
++    tile_text: (f64, f64, f64),
++}
++
++impl Default for GhostPalette {
++    /// Fallback = the Matrix defaults (dark) — only if the DMS
++    /// palette does not exist (yet).
++    fn default() -> Self {
++        Self {
++            panel: hex_rgb("#2b2b22").unwrap(),
++            edge: hex_rgb("#e4e3d7").unwrap(),
++            active: hex_rgb("#bece7f").unwrap(),
++            tile: hex_rgb("#3f4c0a").unwrap(),
++            tile_text: hex_rgb("#daeb99").unwrap(),
++        }
++    }
++}
++
++fn hex_rgb(hex: &str) -> Option<(f64, f64, f64)> {
++    let h = hex.trim().trim_start_matches('#');
++    if h.len() < 6 {
++        return None;
++    }
++    let part = |a: usize| u8::from_str_radix(&h[a..a + 2], 16).ok();
++    Some((
++        f64::from(part(0)?) / 255.0,
++        f64::from(part(2)?) / 255.0,
++        f64::from(part(4)?) / 255.0,
++    ))
++}
++
++fn dms_colors_path() -> Option<PathBuf> {
++    let home = std::env::var("HOME").ok()?;
++    Some(PathBuf::from(home).join(".cache/DankMaterialShell/dms-colors.json"))
++}
++
++/// Read the palette from the DMS color file — roles like
++/// mk::Palette::load() in matrixkit-theme, light/dark from the DMS session.
++fn load_palette() -> GhostPalette {
++    let d = GhostPalette::default();
++    let Some(path) = dms_colors_path() else { return d };
++    let Ok(raw) = std::fs::read_to_string(path) else { return d };
++    let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else { return d };
++    let light = std::env::var("HOME")
++        .ok()
++        .and_then(|h| {
++            std::fs::read_to_string(format!("{h}/.local/state/DankMaterialShell/session.json"))
++                .ok()
++        })
++        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
++        .and_then(|v| v.get("isLightMode").and_then(|b| b.as_bool()))
++        .unwrap_or(false);
++    let mode = &json["colors"][if light { "light" } else { "dark" }];
++    let role = |name: &str, fallback: (f64, f64, f64)| {
++        mode
++            .get(name)
++            .and_then(|v| v.as_str())
++            .and_then(hex_rgb)
++            .unwrap_or(fallback)
++    };
++    GhostPalette {
++        panel: role("surface_container_high", d.panel),
++        edge: role("on_surface", d.edge),
++        active: role("primary", d.active),
++        tile: role("primary_container", d.tile),
++        tile_text: role("on_primary_container", d.tile_text),
++    }
++}
++
++/// MatrixKit accessibility: reduce motion applies to ghosts too.
++fn motion_reduced() -> bool {
++    std::env::var("HOME")
++        .ok()
++        .and_then(|h| std::fs::read_to_string(format!("{h}/.config/matrix/motion")).ok())
++        .map(|s| s.trim() == "reduced")
++        .unwrap_or(false)
++}
++
++/// Change stamp of the color file — goes into the texture hash so a
++/// wallpaper/mode switch recolors the cloud immediately.
++fn palette_stamp() -> u64 {
++    dms_colors_path()
++        .and_then(|p| std::fs::metadata(p).ok())
++        .and_then(|m| m.modified().ok())
++        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
++        .map(|d| d.as_secs())
++        .unwrap_or(0)
++}
++
++/// Fade in and out like the scroll ghost: soft spring, no jumping.
++enum Phase {
++    Hidden,
++    Appearing(Animation),
++    Shown,
++    Vanishing(Animation),
++}
++
++/// When does the ghost show itself? (~/.config/matrix/canvas-ghost)
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub enum GhostMode {
++    /// Only after wheel paging — appears, helps, fades (default).
++    OnScroll,
++    /// Always while the mouse rests on empty space.
++    Always,
++    Off,
++}
++
++pub struct WindowGhost {
++    clock: Clock,
++    config: Rc<RefCell<Config>>,
++    phase: RefCell<Phase>,
++    /// app_id → dekodiertes Icon (None = Fallback-Kachel merken).
++    icons: RefCell<HashMap<String, Option<ImageSurface>>>,
++    /// Zuletzt gerenderte Wolke: (Layout-Hash, Textur).
++    buffer: RefCell<Option<(u64, TextureBuffer<GlesTexture>)>>,
++    /// Last display place (fading out happens in place).
++    last_ort: Cell<(f64, f64)>,
++    /// Last wheel paging — in scroll mode the ghost lives 1.6 s.
++    last_active: Cell<Option<std::time::Instant>>,
++    /// Mode cache (file re-read every 2 s).
++    mode_cache: Cell<Option<(std::time::Instant, GhostMode)>>,
++}
++
++impl WindowGhost {
++    pub fn new(clock: Clock, config: Rc<RefCell<Config>>) -> Self {
++        Self {
++            clock,
++            config,
++            phase: RefCell::new(Phase::Hidden),
++            icons: RefCell::new(HashMap::new()),
++            buffer: RefCell::new(None),
++            last_ort: Cell::new((0.0, 0.0)),
++            last_active: Cell::new(None),
++            mode_cache: Cell::new(None),
++        }
++    }
++
++    /// Wheel paging reports in — the ghost shows itself (scroll mode).
++    pub fn activate(&self) {
++        self.last_active.set(Some(std::time::Instant::now()));
++    }
++
++    fn mode(&self) -> GhostMode {
++        if let Some((when, m)) = self.mode_cache.get() {
++            if when.elapsed().as_secs() < 2 {
++                return m;
++            }
++        }
++        let m = match crate::utils::matrix_setting("canvas-ghost").as_deref() {
++            Some("always") | Some("immer") => GhostMode::Always,
++            Some("off") | Some("aus") => GhostMode::Off,
++            _ => GhostMode::OnScroll,
++        };
++        self.mode_cache.set(Some((std::time::Instant::now(), m)));
++        m
++    }
++
++    /// Shall the ghost be visible? (empty_space = mouse on free canvas)
++    pub fn goal_show(&self, empty_space: bool) -> bool {
++        match self.mode() {
++            GhostMode::Off => false,
++            GhostMode::Always => empty_space,
++            GhostMode::OnScroll => {
++                empty_space
++                    && self
++                        .last_active
++                        .get()
++                        .is_some_and(|t| t.elapsed().as_millis() < 1600)
++            }
++        }
++    }
++
++    fn animation(&self, from: f64, to: f64) -> Animation {
++        let c = self.config.borrow();
++        Animation::new(
++            self.clock.clone(),
++            from,
++            to,
++            0.,
++            c.animations.config_notification_open_close.0,
++        )
++    }
++
++    /// Set the target visibility — a change starts the spring.
++    /// (RefCell because the decision falls in the render path.)
++    pub fn set_target(&self, visible: bool) {
++        let mut phase = self.phase.borrow_mut();
++        // MatrixKit rule: reduced motion = instant, no spring.
++        if motion_reduced() {
++            *phase = if visible { Phase::Shown } else { Phase::Hidden };
++            return;
++        }
++        match (&*phase, visible) {
++            (Phase::Hidden | Phase::Vanishing(_), true) => {
++                let from = match &*phase {
++                    Phase::Vanishing(anim) => anim.value().clamp(0.0, 1.0),
++                    _ => 0.0,
++                };
++                *phase = Phase::Appearing(self.animation(from, 1.0));
++            }
++            (Phase::Shown | Phase::Appearing(_), false) => {
++                let from = match &*phase {
++                    Phase::Appearing(anim) => anim.value().clamp(0.0, 1.0),
++                    _ => 1.0,
++                };
++                *phase = Phase::Vanishing(self.animation(from, 0.0));
++            }
++            _ => (),
++        }
++    }
++
++    /// Resolve finished transitions (from Niri::advance_animations).
++    pub fn advance_animations(&self) {
++        let mut phase = self.phase.borrow_mut();
++        match &*phase {
++            Phase::Appearing(anim) if anim.is_done() => *phase = Phase::Shown,
++            Phase::Vanishing(anim) if anim.is_clamped_done() => *phase = Phase::Hidden,
++            _ => (),
++        }
++    }
++
++    pub fn are_animations_ongoing(&self) -> bool {
++        matches!(
++            &*self.phase.borrow(),
++            Phase::Appearing(_) | Phase::Vanishing(_)
++        )
++    }
++
++    /// Current opacity of the spring.
++    pub fn alpha(&self) -> f64 {
++        match &*self.phase.borrow() {
++            Phase::Hidden => 0.0,
++            Phase::Shown => 1.0,
++            Phase::Appearing(anim) | Phase::Vanishing(anim) => anim.value().clamp(0.0, 1.0),
++        }
++    }
++
++    pub fn note_down_ort(&self, x: f64, y: f64) {
++        self.last_ort.set((x, y));
++    }
++
++    pub fn last_ort(&self) -> (f64, f64) {
++        self.last_ort.get()
++    }
++
++    /// The last drawn cloud (for fading out in place).
++    pub fn last_texture(&self) -> Option<TextureBuffer<GlesTexture>> {
++        self.buffer.borrow().as_ref().map(|(_, b)| b.clone())
++    }
++
++    /// The icon cloud as a texture — cached as long as window set,
++    /// arrangement and view center do not change.
++    pub fn render<R: NiriRenderer>(
++        &self,
++        renderer: &mut R,
++        scale: f64,
++        window: &[(String, Point<f64, Logical>, bool)],
++    ) -> Option<TextureBuffer<GlesTexture>> {
++        if window.is_empty() {
++            return None;
++        }
++
++        // 1) Paging order: like the mouse wheel — left to right.
++        let mut row: Vec<usize> = (0..window.len()).collect();
++        row.sort_by(|&a, &b| {
++            window[a]
++                .1
++                .x
++                .partial_cmp(&window[b].1.x)
++                .unwrap_or(std::cmp::Ordering::Equal)
++                .then(
++                    window[a]
++                        .1
++                        .y
++                        .partial_cmp(&window[b].1.y)
++                        .unwrap_or(std::cmp::Ordering::Equal),
++                )
++        });
++
++        // 2) The excerpt: at most THREE stacked — the active one in
++        //    the middle, the predecessor above, the successor below
++        //    (with wraparound, like the paging itself).
++        let active_pos = row.iter().position(|&i| window[i].2).unwrap_or(0);
++        let n = row.len();
++        let selection: Vec<usize> = if n <= LIST_MAX {
++            row
++        } else {
++            vec![
++                row[(active_pos + n - 1) % n],
++                row[active_pos],
++                row[(active_pos + 1) % n],
++            ]
++        };
++        let list: Vec<(String, Point<f64, Logical>, bool)> =
++            selection.iter().map(|&i| window[i].clone()).collect();
++
++        // 3) Column places: centers at a fixed pace, one column.
++        let edge = PADDING + ACTIVE / 2.0;
++        let width = 2.0 * edge;
++        let height = (list.len().saturating_sub(1)) as f64 * LIST_CADENCE + 2.0 * edge;
++        let slots: Vec<(f64, f64, bool)> = list
++            .iter()
++            .enumerate()
++            .map(|(k, (_, _, active))| (edge, edge + k as f64 * LIST_CADENCE, *active))
++            .collect();
++
++        // Cache key: apps + rasterized places + view center + scale.
++        let mut h = std::collections::hash_map::DefaultHasher::new();
++        for ((app, _, _), (x, y, active)) in list.iter().zip(&slots) {
++            app.hash(&mut h);
++            (((*x / 3.0) as i64), ((*y / 3.0) as i64), *active).hash(&mut h);
++        }
++        scale.to_bits().hash(&mut h);
++        palette_stamp().hash(&mut h);
++        let key = h.finish();
++
++        if let Some((k, buf)) = &*self.buffer.borrow() {
++            if *k == key {
++                return Some(buf.clone());
++            }
++        }
++
++        let buf = self
++            .draw_all(
++                renderer.as_gles_renderer(),
++                scale,
++                width,
++                height,
++                &list,
++                &slots,
++            )
++            .ok()?;
++        *self.buffer.borrow_mut() = Some((key, buf.clone()));
++        Some(buf)
++    }
++
++    fn draw_all(
++        &self,
++        renderer: &mut GlesRenderer,
++        scale: f64,
++        width: f64,
++        height: f64,
++        window: &[(String, Point<f64, Logical>, bool)],
++        slots: &[(f64, f64, bool)],
++    ) -> anyhow::Result<TextureBuffer<GlesTexture>> {
++        let b_phys = (width * scale).round() as i32;
++        let h_phys = (height * scale).round() as i32;
++        let surface = ImageSurface::create(Format::ARgb32, b_phys, h_phys)?;
++        let cr = cairo::Context::new(&surface)?;
++        cr.scale(scale, scale);
++
++        // GeistKit: the living palette — follows wallpaper and light/dark.
++        let p = load_palette();
++
++        // Panel: slightly translucent surface with a fine edge.
++        // Radius CONCENTRIC to the icon squircles (mk::radius rule:
++        // outer = inner + inset).
++        let panel_radius = corner(ICON) + PADDING;
++        rounded_rect(&cr, 0.5, 0.5, width - 1.0, height - 1.0, panel_radius);
++        cr.set_source_rgba(p.panel.0, p.panel.1, p.panel.2, 0.92);
++        cr.fill_preserve()?;
++        cr.set_source_rgba(p.edge.0, p.edge.1, p.edge.2, 0.12);
++        cr.set_line_width(1.0);
++        cr.stroke()?;
++
++        let mut icons = self.icons.borrow_mut();
++        // Draw the active icon last — it visibly lies on top.
++        let mut ordering: Vec<usize> = (0..slots.len()).collect();
++        ordering.sort_by_key(|&i| slots[i].2);
++        for i in ordering {
++            let (app_id, _, _) = &window[i];
++            let (x, y, active) = slots[i];
++            let icon = icons
++                .entry(app_id.clone())
++                .or_insert_with(|| load_icon(app_id));
++
++            let gr = if active { ACTIVE } else { ICON };
++            let ox = x - gr / 2.0;
++            let oy = y - gr / 2.0;
++            // Endless-wheel feel (user design): top and bottom fade the
++            // neighbors out, only the view center stands fully.
++            let fade = if active { 1.0 } else { 0.45 };
++
++            // Uniform squircle shape for ALL icons (consistency — foreign
++            // icons get the MatrixKit curve too).
++            cr.save()?;
++            cr.push_group();
++            rounded_rect(&cr, ox, oy, gr, gr, corner(gr));
++            cr.clip();
++            match icon {
++                Some(img) => {
++                    let iw = img.width() as f64;
++                    let ih = img.height() as f64;
++                    cr.translate(ox, oy);
++                    cr.scale(gr / iw, gr / ih);
++                    cr.set_source_surface(img, 0.0, 0.0)?;
++                    cr.paint()?;
++                }
++                None => {
++                    // Fallback: tinted tile with the initial letter
++                    // (primary_container / on_primary_container).
++                    cr.set_source_rgba(p.tile.0, p.tile.1, p.tile.2, 1.0);
++                    cr.paint()?;
++                    let letter = app_id
++                        .rsplit(['.', '-'])
++                        .next()
++                        .and_then(|t| t.chars().next())
++                        .unwrap_or('?')
++                        .to_uppercase()
++                        .to_string();
++                    let layout = pangocairo::functions::create_layout(&cr);
++                    let mut font = FontDescription::from_string("Inter Variable Bold 12");
++                    font.set_absolute_size(gr * 0.55 * f64::from(pango::SCALE));
++                    layout.set_font_description(Some(&font));
++                    layout.set_text(&letter);
++                    let (tw, th) = layout.pixel_size();
++                    cr.move_to(
++                        ox + (gr - f64::from(tw)) / 2.0,
++                        oy + (gr - f64::from(th)) / 2.0,
++                    );
++                    cr.set_source_rgba(p.tile_text.0, p.tile_text.1, p.tile_text.2, 1.0);
++                    pangocairo::functions::show_layout(&cr, &layout);
++                }
++            }
++            cr.pop_group_to_source()?;
++            cr.paint_with_alpha(fade)?;
++            cr.restore()?;
++
++            // View center: larger icon + same-shaped squircle edge
++            // (NO circle — the edge follows the icon shape, concentrically).
++            if active {
++                let air = 2.5;
++                rounded_rect(
++                    &cr,
++                    ox - air,
++                    oy - air,
++                    gr + 2.0 * air,
++                    gr + 2.0 * air,
++                    corner(gr) + air,
++                );
++                cr.set_source_rgba(p.active.0, p.active.1, p.active.2, 0.95);
++                cr.set_line_width(2.0);
++                cr.stroke()?;
++            }
++        }
++        drop(cr);
++
++        let data = surface.take_data().unwrap();
++        let buffer = TextureBuffer::from_memory(
++            renderer,
++            &data,
++            smithay::backend::allocator::Fourcc::Argb8888,
++            (b_phys, h_phys),
++            false,
++            scale,
++            Transform::Normal,
++            Vec::new(),
++        )?;
++        Ok(buffer)
++    }
++}
++
++fn rounded_rect(cr: &cairo::Context, x: f64, y: f64, b: f64, h: f64, r: f64) {
++    let r = r.min(b / 2.0).min(h / 2.0);
++    cr.new_path();
++    cr.arc(x + b - r, y + r, r, -std::f64::consts::FRAC_PI_2, 0.0);
++    cr.arc(x + b - r, y + h - r, r, 0.0, std::f64::consts::FRAC_PI_2);
++    cr.arc(
++        x + r,
++        y + h - r,
++        r,
++        std::f64::consts::FRAC_PI_2,
++        std::f64::consts::PI,
++    );
++    cr.arc(
++        x + r,
++        y + r,
++        r,
++        std::f64::consts::PI,
++        1.5 * std::f64::consts::PI,
++    );
++    cr.close_path();
++}
++
++/// App icon as a cairo surface: PNG from the hicolor themes, turned
++/// into premultiplied ARgb32. None = no icon found.
++fn load_icon(app_id: &str) -> Option<ImageSurface> {
++    if app_id.is_empty() {
++        return None;
++    }
++    let path = icon_path(app_id)?;
++    let file = std::io::BufReader::new(std::fs::File::open(path).ok()?);
++    let mut reader = png::Decoder::new(file).read_info().ok()?;
++    let mut buf = vec![0u8; reader.output_buffer_size()?];
++    let info = reader.next_frame(&mut buf).ok()?;
++    if info.bit_depth != png::BitDepth::Eight {
++        return None;
++    }
++    let (w, h) = (info.width as usize, info.height as usize);
++    let stride = Format::ARgb32.stride_for_width(w as u32).ok()? as usize;
++    let mut data = vec![0u8; stride * h];
++    let channels = match info.color_type {
++        png::ColorType::Rgba => 4,
++        png::ColorType::Rgb => 3,
++        _ => return None,
++    };
++    for line in 0..h {
++        for column in 0..w {
++            let q = (line * w + column) * channels;
++            let (r, g, b, a) = if channels == 4 {
++                (buf[q], buf[q + 1], buf[q + 2], buf[q + 3])
++            } else {
++                (buf[q], buf[q + 1], buf[q + 2], 255)
++            };
++            // Premultiply (cairo ARgb32) + native-endian Pixelwort.
++            let m = |k: u8| ((k as u32 * a as u32) / 255) as u32;
++            let px: u32 = ((a as u32) << 24) | (m(r) << 16) | (m(g) << 8) | m(b);
++            let z = line * stride + column * 4;
++            data[z..z + 4].copy_from_slice(&px.to_ne_bytes());
++        }
++    }
++    ImageSurface::create_for_data(data, Format::ARgb32, w as i32, h as i32, stride as i32).ok()
++}
++
++fn icon_path(app_id: &str) -> Option<PathBuf> {
++    let mut roots: Vec<String> = Vec::new();
++    if let Ok(h) = std::env::var("HOME") {
++        roots.push(format!("{h}/.local/share/icons"));
++    }
++    roots.push("/usr/share/icons".to_string());
++    roots.push("/var/lib/flatpak/exports/share/icons".to_string());
++    for wurzel in &roots {
++        for size in ["128x128", "64x64", "256x256", "48x48", "512x512"] {
++            let p = PathBuf::from(format!("{wurzel}/hicolor/{size}/apps/{app_id}.png"));
++            if p.exists() {
++                return Some(p);
++            }
++        }
++    }
++    None
++}
+diff --git a/src/utils/mod.rs b/src/utils/mod.rs
+index bbeac5b..5703864 100644
+--- a/src/utils/mod.rs
++++ b/src/utils/mod.rs
+@@ -635,3 +635,18 @@ mod tests {
+         check((0, 0, 10, 20), (20, 30, 40, 50), (0, 0));
+     }
+ }
++
++
++/// Matrix-Einstellungs-Kultur (~/.config/matrix/<name>): kleine, lesbare
++/// Files — the canvas reads them LIVE, changes act immediately.
++pub fn matrix_setting(name: &str) -> Option<String> {
++    let home = std::env::var("HOME").ok()?;
++    std::fs::read_to_string(format!("{home}/.config/matrix/{name}"))
++        .ok()
++        .map(|s| s.trim().to_string())
++}
++
++/// Switch convention: missing file = ON; only "aus" switches off.
++pub fn matrix_switch_on(name: &str) -> bool {
++    matrix_setting(name).as_deref() != Some("aus")
++}

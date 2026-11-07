@@ -1,0 +1,1412 @@
+diff --git a/niri-config/src/appearance.rs b/niri-config/src/appearance.rs
+index a1c8327..4af29f4 100644
+--- a/niri-config/src/appearance.rs
++++ b/niri-config/src/appearance.rs
+@@ -1060,6 +1060,44 @@ pub struct BackgroundEffectRule {
+     #[knuffel(child, unwrap(argument))]
+     pub xray: Option<bool>,
+     #[knuffel(child, unwrap(argument))]
++    pub glass: Option<bool>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_inset: Option<FloatOrInt<0, 512>>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_band: Option<FloatOrInt<1, 256>>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_bend: Option<FloatOrInt<0, 64>>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_scrim: Option<FloatOrInt<0, 1>>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_shadow: Option<FloatOrInt<0, 1>>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_shadow_spread: Option<FloatOrInt<0, 128>>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_inset_x: Option<FloatOrInt<0, 512>>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_inset_y: Option<FloatOrInt<0, 512>>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_height: Option<FloatOrInt<0, 4096>>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_anchor_top: Option<bool>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_union: Option<FloatOrInt<0, 256>>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_focus: Option<FloatOrInt<0, 1>>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_focus_keep: Option<FloatOrInt<0, 512>>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_focus_center: Option<FloatOrInt<0, 1>>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_focus_scrim_above: Option<FloatOrInt<0, 1>>,
++    #[knuffel(child, unwrap(argument))]
++    pub glass_focus_scrim_below: Option<FloatOrInt<0, 1>>,
++    /// Matrix R126: play the island pop (0.86 -> 1 spring) when the
++    /// surface appears — for solitary glass cards (menus, Zentrale).
++    #[knuffel(child, unwrap(argument))]
++    pub glass_pop: Option<bool>,
++    #[knuffel(child, unwrap(argument))]
+     pub blur: Option<bool>,
+     #[knuffel(child, unwrap(argument))]
+     pub noise: Option<FloatOrInt<0, 1000>>,
+@@ -1085,13 +1123,155 @@ pub struct BackgroundEffect {
+     /// - `Some(true)`: always blur
+     pub blur: Option<bool>,
+ 
++    /// Liquid-glass refraction of the captured backdrop (Matrix R106).
++    ///
++    /// Implies a non-xray framebuffer capture; pairs with `blur` for frost.
++    pub glass: Option<bool>,
++
++    /// Uniform inset of the glass body inside the surface geometry.
++    ///
++    /// Layer surfaces often reserve a margin around their visible pill
++    /// (e.g. for a drop shadow); the glass shape must hug the pill, so
++    /// the SDF rect shrinks by this many logical pixels per side.
++    pub glass_inset: Option<f64>,
++
++    /// Width of the refraction rim in logical pixels (default 16).
++    ///
++    /// Live-tunable: the rule lives in an include the settings toggle
++    /// owns, and niri reloads includes on change — no rebuild needed.
++    pub glass_band: Option<f64>,
++
++    /// Maximum refraction displacement in logical pixels (default 10).
++    pub glass_bend: Option<f64>,
++
++    /// Legibility limiter 0..1 (default 0.35): the glass measures its
++    /// own frosted brightness and darkens proportionally on bright
++    /// backdrops, so light panel text stays readable (the macOS
++    /// limitAveragePixelLuminance idea, in-pass).
++    pub glass_scrim: Option<f64>,
++
++    /// Drop shadow strength 0..1 (default 0.55), derived from the SAME
++    /// distance field as the glass body — one shape, one truth (shape
++    /// family phase A). 0 disables; the app then draws no shadow ring
++    /// either, so the silhouette is the single source.
++    pub glass_shadow: Option<f64>,
++
++    /// Shadow spread (gaussian sigma) in logical pixels (default 14).
++    pub glass_shadow_spread: Option<f64>,
++
++    /// Per-axis insets (fall back to `glass_inset`): surfaces like the
++    /// bar reserve shadow room on one side only.
++    pub glass_inset_x: Option<f64>,
++    pub glass_inset_y: Option<f64>,
++
++    /// Fixed body height in logical pixels. Surfaces GROW for menus —
++    /// the glass body must not: with a height the body stays anchored
++    /// at the anchor edge no matter the surface: bottom by default
++    /// (dock), `glass-anchor-top true` for bar-like surfaces.
++    pub glass_height: Option<f64>,
++    pub glass_anchor_top: Option<bool>,
++
++    /// Murano register (R113): union distance in logical pixels for
++    /// merging this body with OTHER glass surfaces via smooth minimum —
++    /// close panels read as one poured form. 0 disables (default 24).
++    pub glass_union: Option<f64>,
++
++    /// R195: the glass body follows the wheel focus of the Raum. The
++    /// pane scales with the surface's distance from the screen center
++    /// (anchored on its center on both axes — R198: content sits
++    /// centered in the shell, so both gaps stay equal): scale =
++    /// (1-k) + k*phase, where k is this value and phase is 1 at the
++    /// center, 0 at the edge. MUST mirror the content formula in
++    /// rabbit's raum.rs (focus 0.85+0.30*phase over a shell measured
++    /// at 1.15 → k = 0.30/1.15 ≈ 0.2609). 0 disables (default).
++    pub glass_focus: Option<f64>,
++    /// R195: logical pixels of the pane that do NOT scale with focus
++    /// (the constant padding around the scaled content; the Raum pads
++    /// spacing::L = 16 per side → 32).
++    pub glass_focus_keep: Option<f64>,
++
++    /// R203: where the focus lives, as a fraction of the output
++    /// height (default 0.5 = center). The Raum moves it UP (0.40):
++    /// below the focus the text dives darkly under the dock, and
++    /// larger future glass elements get room to grow downward.
++    /// MUST mirror FOKUS_HOEHE in rabbit's raum.rs.
++    pub glass_focus_center: Option<f64>,
++    /// R203: extra scrim (darkening) ramped in as a body LEAVES the
++    /// focus upward — gentle, the text stays readable.
++    pub glass_focus_scrim_above: Option<f64>,
++    /// R203: extra scrim as a body ENTERS from below — strong, the
++    /// pane passes BEHIND the dock (topmost layer) and must yield.
++    pub glass_focus_scrim_below: Option<f64>,
++    /// Matrix R126: appearance pop for solitary glass cards.
++    pub glass_pop: Option<bool>,
++
+     pub noise: Option<f64>,
+     pub saturation: Option<f64>,
+ }
+ 
+ impl MergeWith<BackgroundEffectRule> for BackgroundEffect {
+     fn merge_with(&mut self, part: &BackgroundEffectRule) {
+-        merge_clone_opt!((self, part), xray, blur);
++        merge_clone_opt!((self, part), xray, blur, glass);
++
++        if let Some(x) = part.glass_inset {
++            self.glass_inset = Some(x.0);
++        }
++
++        if let Some(x) = part.glass_band {
++            self.glass_band = Some(x.0);
++        }
++
++        if let Some(x) = part.glass_bend {
++            self.glass_bend = Some(x.0);
++        }
++
++        if let Some(x) = part.glass_scrim {
++            self.glass_scrim = Some(x.0);
++        }
++
++        if let Some(x) = part.glass_shadow {
++            self.glass_shadow = Some(x.0);
++        }
++
++        if let Some(x) = part.glass_shadow_spread {
++            self.glass_shadow_spread = Some(x.0);
++        }
++
++        if let Some(x) = part.glass_inset_x {
++            self.glass_inset_x = Some(x.0);
++        }
++
++        if let Some(x) = part.glass_inset_y {
++            self.glass_inset_y = Some(x.0);
++        }
++
++        if let Some(x) = part.glass_height {
++            self.glass_height = Some(x.0);
++        }
++
++        merge_clone_opt!((self, part), glass_anchor_top);
++
++        if let Some(x) = part.glass_union {
++            self.glass_union = Some(x.0);
++        }
++        if let Some(x) = part.glass_focus {
++            self.glass_focus = Some(x.0);
++        }
++        if let Some(x) = part.glass_focus_keep {
++            self.glass_focus_keep = Some(x.0);
++        }
++        if let Some(x) = part.glass_focus_center {
++            self.glass_focus_center = Some(x.0);
++        }
++        if let Some(x) = part.glass_focus_scrim_above {
++            self.glass_focus_scrim_above = Some(x.0);
++        }
++        if let Some(x) = part.glass_focus_scrim_below {
++            self.glass_focus_scrim_below = Some(x.0);
++        }
++        if let Some(x) = part.glass_pop {
++            self.glass_pop = Some(x);
++        }
+ 
+         if let Some(x) = part.noise {
+             self.noise = Some(x.0);
+diff --git a/src/layer/mapped.rs b/src/layer/mapped.rs
+index fbaa6fc..fa06a9e 100644
+--- a/src/layer/mapped.rs
++++ b/src/layer/mapped.rs
+@@ -1,14 +1,15 @@
+ use niri_config::utils::MergeWith as _;
+ use niri_config::{Config, LayerRule};
+ use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
++use smithay::backend::renderer::element::utils::RescaleRenderElement;
+ use smithay::backend::renderer::element::Kind;
+ use smithay::desktop::{LayerSurface, PopupKind, PopupManager};
+-use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
++use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size};
+ use smithay::wayland::compositor::{remove_pre_commit_hook, HookId};
+ use smithay::wayland::shell::wlr_layer::{ExclusiveZone, Layer};
+ 
+ use super::ResolvedLayerRules;
+-use crate::animation::Clock;
++use crate::animation::{Animation, Clock};
+ use crate::layout::shadow::Shadow;
+ use crate::niri_render_elements;
+ use crate::render_helpers::background_effect::BackgroundEffectElement;
+@@ -53,6 +54,10 @@ pub struct MappedLayer {
+ 
+     /// Clock for driving animations.
+     clock: Clock,
++
++    /// Matrix R126: the appearance pop of solitary glass cards — the
++    /// compositor scales body AND content together (island spring).
++    pop: Option<Animation>,
+ }
+ 
+ niri_render_elements! {
+@@ -61,6 +66,11 @@ niri_render_elements! {
+         SolidColor = SolidColorRenderElement,
+         Shadow = ShadowRenderElement,
+         BackgroundEffect = BackgroundEffectElement,
++        // Matrix R126: pop-scaled twins of the four element kinds.
++        PopWayland = RescaleRenderElement<WaylandSurfaceRenderElement<R>>,
++        PopSolid = RescaleRenderElement<SolidColorRenderElement>,
++        PopShadow = RescaleRenderElement<ShadowRenderElement>,
++        PopEffect = RescaleRenderElement<BackgroundEffectElement>,
+     }
+ }
+ 
+@@ -79,6 +89,33 @@ impl MappedLayer {
+         shadow_config.on = false;
+         shadow_config.merge_with(&rules.shadow);
+ 
++        // Matrix R126: solitary glass (union 0) pops by DEFAULT — no
++        // config change needed, so old configs stay valid everywhere.
++        // glass-pop overrides in both directions.
++        let effect = &rules.background_effect;
++        let solitary = effect.glass == Some(true)
++            && effect
++                .glass_pop
++                .unwrap_or(effect.glass_union == Some(0.0));
++        let pop = solitary.then(|| {
++            Animation::new(
++                clock.clone(),
++                0.86,
++                1.0,
++                0.,
++                niri_config::Animation {
++                    off: false,
++                    kind: niri_config::animations::Kind::Spring(
++                        niri_config::animations::SpringParams {
++                            damping_ratio: 0.7,
++                            stiffness: 800,
++                            epsilon: 0.0001,
++                        },
++                    ),
++                },
++            )
++        });
++
+         Self {
+             surface,
+             pre_commit_hook,
+@@ -90,6 +127,7 @@ impl MappedLayer {
+             shadow: Shadow::new(shadow_config),
+             blur_config: config.blur,
+             clock,
++            pop,
+         }
+     }
+ 
+@@ -127,7 +165,7 @@ impl MappedLayer {
+     }
+ 
+     pub fn are_animations_ongoing(&self) -> bool {
+-        self.rules.baba_is_float
++        self.rules.baba_is_float || self.pop.as_ref().is_some_and(|a| !a.is_done())
+     }
+ 
+     pub fn surface(&self) -> &LayerSurface {
+@@ -193,7 +231,44 @@ impl MappedLayer {
+         push: &mut dyn FnMut(LayerSurfaceRenderElement<R>),
+     ) {
+         let scale = Scale::from(self.scale);
+-        let alpha = self.rules.opacity.unwrap_or(1.).clamp(0., 1.);
++        // Matrix R126: while the appearance pop settles, every element
++        // rides a scale around the surface center — body and content
++        // together, compositor-side.
++        let pop_scale = self
++            .pop
++            .as_ref()
++            .map(|a| a.value())
++            .filter(|v| (*v - 1.0).abs() > 0.0005);
++        // Matrix R128: fade 0..1 across the spring travel — content
++        // and glass appear TOGETHER (the naked-slab flash is gone).
++        let pop_fade = self
++            .pop
++            .as_ref()
++            .map(|a| (((a.value() - 0.86) / 0.14).clamp(0.0, 1.0)) as f32)
++            .unwrap_or(1.0);
++        let pop_center: Point<i32, Physical> = {
++            let size = self.block_out_buffer.size();
++            Point::<f64, Logical>::from((location.x + size.w / 2., location.y + size.h / 2.))
++                .to_physical_precise_round(self.scale)
++        };
++        let mut pop_push = |elem: LayerSurfaceRenderElement<R>| match (pop_scale, elem) {
++            (Some(s), LayerSurfaceRenderElement::Wayland(e)) => {
++                push(RescaleRenderElement::from_element(e, pop_center, s).into())
++            }
++            (Some(s), LayerSurfaceRenderElement::SolidColor(e)) => {
++                push(RescaleRenderElement::from_element(e, pop_center, s).into())
++            }
++            (Some(s), LayerSurfaceRenderElement::Shadow(e)) => {
++                push(RescaleRenderElement::from_element(e, pop_center, s).into())
++            }
++            (Some(s), LayerSurfaceRenderElement::BackgroundEffect(e)) => {
++                push(RescaleRenderElement::from_element(e, pop_center, s).into())
++            }
++            (_, elem) => push(elem),
++        };
++        let push: &mut dyn FnMut(LayerSurfaceRenderElement<R>) = &mut pop_push;
++
++        let alpha = self.rules.opacity.unwrap_or(1.).clamp(0., 1.) * pop_fade;
+ 
+         let bob_offset = self.bob_offset();
+         let location = location + bob_offset;
+@@ -249,6 +324,7 @@ impl MappedLayer {
+             self.blur_config,
+             radius,
+             self.rules.background_effect,
++            pop_fade,
+             should_block_out,
+             xray_pos,
+             &mut |elem| push(elem.into()),
+@@ -268,7 +344,44 @@ impl MappedLayer {
+         }
+ 
+         let scale = Scale::from(self.scale);
+-        let alpha = self.rules.opacity.unwrap_or(1.).clamp(0., 1.);
++        // Matrix R126: while the appearance pop settles, every element
++        // rides a scale around the surface center — body and content
++        // together, compositor-side.
++        let pop_scale = self
++            .pop
++            .as_ref()
++            .map(|a| a.value())
++            .filter(|v| (*v - 1.0).abs() > 0.0005);
++        // Matrix R128: fade 0..1 across the spring travel — content
++        // and glass appear TOGETHER (the naked-slab flash is gone).
++        let pop_fade = self
++            .pop
++            .as_ref()
++            .map(|a| (((a.value() - 0.86) / 0.14).clamp(0.0, 1.0)) as f32)
++            .unwrap_or(1.0);
++        let pop_center: Point<i32, Physical> = {
++            let size = self.block_out_buffer.size();
++            Point::<f64, Logical>::from((location.x + size.w / 2., location.y + size.h / 2.))
++                .to_physical_precise_round(self.scale)
++        };
++        let mut pop_push = |elem: LayerSurfaceRenderElement<R>| match (pop_scale, elem) {
++            (Some(s), LayerSurfaceRenderElement::Wayland(e)) => {
++                push(RescaleRenderElement::from_element(e, pop_center, s).into())
++            }
++            (Some(s), LayerSurfaceRenderElement::SolidColor(e)) => {
++                push(RescaleRenderElement::from_element(e, pop_center, s).into())
++            }
++            (Some(s), LayerSurfaceRenderElement::Shadow(e)) => {
++                push(RescaleRenderElement::from_element(e, pop_center, s).into())
++            }
++            (Some(s), LayerSurfaceRenderElement::BackgroundEffect(e)) => {
++                push(RescaleRenderElement::from_element(e, pop_center, s).into())
++            }
++            (_, elem) => push(elem),
++        };
++        let push: &mut dyn FnMut(LayerSurfaceRenderElement<R>) = &mut pop_push;
++
++        let alpha = self.rules.opacity.unwrap_or(1.).clamp(0., 1.) * pop_fade;
+ 
+         let bob_offset = self.bob_offset();
+         let location = location + bob_offset;
+@@ -318,6 +431,7 @@ impl MappedLayer {
+                 self.blur_config,
+                 popup_rules.geometry_corner_radius.unwrap_or_default(),
+                 effect,
++                pop_fade,
+                 false,
+                 xray_pos,
+                 &mut |elem| push(elem.into()),
+diff --git a/src/niri.rs b/src/niri.rs
+index 61098e8..2bc29ff 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -3003,6 +3003,7 @@ impl Niri {
+     }
+ 
+     pub fn output_resized(&mut self, output: &Output) {
++        Self::matrix_frame_trace("output-resized");
+         let output_size = output_size(output);
+         let scale = output.current_scale();
+         let transform = output.current_transform();
+@@ -4200,6 +4201,13 @@ impl Niri {
+     ) {
+         let _span = tracy_client::span!("Niri::render");
+ 
++        // R195: focus glass needs the screen center — ambient per
++        // output pass, same style as the Murano register.
++        {
++            let vs = output_size(output);
++            crate::render_helpers::background_effect::set_view_size(vs.w, vs.h);
++        }
++
+         if ctx.target == RenderTarget::Output {
+             if let Some(preview) = self.config.borrow().debug.preview_render {
+                 ctx.target = match preview {
+@@ -4613,6 +4621,24 @@ impl Niri {
+         }
+     }
+ 
++    /// Matrix R130: file-gated frame trace. The session compositor's
++    /// stderr goes to the TTY, so live diagnosis needs a file sink.
++    /// Enable with `touch /tmp/niri-trace`; output in /tmp/niri-trace.log.
++    pub(crate) fn matrix_frame_trace(msg: &str) {
++        use std::io::Write as _;
++        if !std::path::Path::new("/tmp/niri-trace").exists() {
++            return;
++        }
++        if let Ok(mut f) = std::fs::OpenOptions::new()
++            .create(true)
++            .append(true)
++            .open("/tmp/niri-trace.log")
++        {
++            let t = get_monotonic_time();
++            let _ = writeln!(f, "[{:>10.3}] {msg}", t.as_secs_f64());
++        }
++    }
++
+     fn redraw(&mut self, backend: &mut Backend, output: &Output) {
+         let _span = tracy_client::span!("Niri::redraw");
+ 
+@@ -4623,6 +4649,11 @@ impl Niri {
+             RedrawState::Queued | RedrawState::WaitingForEstimatedVBlankAndQueued(_)
+         ));
+ 
++        Self::matrix_frame_trace(&format!(
++            "redraw seq={} state={:?}",
++            state.frame_callback_sequence, state.redraw_state
++        ));
++
+         let target_presentation_time = state.frame_clock.next_presentation_time();
+ 
+         // Freeze the clock at the target time.
+@@ -4659,6 +4690,15 @@ impl Niri {
+             res = backend.render(self, output, target_presentation_time);
+         }
+ 
++        Self::matrix_frame_trace(&format!(
++            "redraw-res {}",
++            match res {
++                RenderResult::Submitted => "submitted",
++                RenderResult::NoDamage => "no-damage",
++                RenderResult::Skipped => "skipped",
++            }
++        ));
++
+         let is_locked = self.is_locked();
+         let state = self.output_state.get_mut(output).unwrap();
+ 
+@@ -5056,8 +5096,9 @@ impl Niri {
+ 
+         let state = self.output_state.get(output).unwrap();
+         let sequence = state.frame_callback_sequence;
++        Self::matrix_frame_trace(&format!("send-frames seq={sequence}"));
+ 
+-        let should_send = |surface: &WlSurface, states: &SurfaceData| {
++        let should_send = move |surface: &WlSurface, states: &SurfaceData| {
+             // Do the standard primary scanout output check. For pointer surfaces it deduplicates
+             // the frame callbacks across potentially multiple outputs, and for regular windows and
+             // layer-shell surfaces it avoids sending frame callbacks to invisible surfaces.
+@@ -5090,6 +5131,43 @@ impl Niri {
+             }
+         };
+ 
++        // Matrix R129 (macOS doctrine): layer surfaces mapped on this output
++        // always receive frame callbacks. AppKit counts fully transparent
++        // windows as visible; visibility is structural, not per-frame. A layer
++        // surface whose element was skipped for one render (fade at 0, pop
++        // scale, transient occlusion) must not lose its ticks — that starves
++        // the client into permanent staleness. Only a surface actively scanned
++        // out on a DIFFERENT output is denied (cross-output dedup).
++        let should_send_layer = move |surface: &WlSurface, states: &SurfaceData| {
++            let current_primary_output = surface_primary_scanout_output(surface, states);
++            if let Some(primary) = current_primary_output.as_ref() {
++                if primary != output {
++                    Self::matrix_frame_trace(&format!("L-deny-other {:?}", surface.id()));
++                    return None;
++                }
++            }
++
++            let frame_throttling_state = states
++                .data_map
++                .get_or_insert(SurfaceFrameThrottlingState::default);
++            let mut last_sent_at = frame_throttling_state.last_sent_at.borrow_mut();
++
++            let mut send = true;
++            if let Some((last_output, last_sequence)) = &*last_sent_at {
++                if last_output == output && *last_sequence == sequence {
++                    send = false;
++                }
++            }
++            if send {
++                *last_sent_at = Some((output.clone(), sequence));
++                Self::matrix_frame_trace(&format!("L-send {:?} seq={sequence}", surface.id()));
++                Some(output.clone())
++            } else {
++                Self::matrix_frame_trace(&format!("L-throttle {:?} seq={sequence}", surface.id()));
++                None
++            }
++        };
++
+         let frame_callback_time = get_monotonic_time();
+ 
+         for mapped in self.layout.windows_for_output_mut(output) {
+@@ -5106,7 +5184,7 @@ impl Niri {
+                 output,
+                 frame_callback_time,
+                 FRAME_CALLBACK_THROTTLE,
+-                should_send,
++                should_send_layer,
+             );
+         }
+ 
+diff --git a/src/render_helpers/background_effect.rs b/src/render_helpers/background_effect.rs
+index d148b6c..37ca59a 100644
+--- a/src/render_helpers/background_effect.rs
++++ b/src/render_helpers/background_effect.rs
+@@ -1,10 +1,13 @@
+-use std::sync::{Arc, Mutex};
++use std::collections::HashMap;
++use std::sync::{Arc, Mutex, OnceLock};
++use std::time::Instant;
+ 
+ use niri_config::CornerRadius;
+ use smithay::backend::renderer::gles::GlesRenderer;
+ use smithay::utils::{Logical, Point, Rectangle, Scale};
+ use smithay::wayland::compositor::{with_states, SurfaceData};
+ use wayland_server::protocol::wl_surface::WlSurface;
++use wayland_server::Resource;
+ 
+ use crate::handlers::background_effect::get_cached_blur_region;
+ use crate::niri_render_elements;
+@@ -34,6 +37,26 @@ pub struct BackgroundEffect {
+ pub struct Options {
+     pub blur: bool,
+     pub xray: bool,
++    pub glass: bool,
++    pub glass_inset: f64,
++    pub glass_band: f64,
++    pub glass_bend: f64,
++    pub glass_scrim: f64,
++    /// Matrix R128: appearance fade 0..1 driven by the pop spring —
++    /// the glass must not show before the client painted content.
++    pub glass_fade: f32,
++    pub glass_shadow: f64,
++    pub glass_shadow_spread: f64,
++    pub glass_inset_x: f64,
++    pub glass_inset_y: f64,
++    pub glass_height: f64,
++    pub glass_anchor_top: bool,
++    pub glass_union: f64,
++    pub glass_focus: f64,
++    pub glass_focus_keep: f64,
++    pub glass_focus_center: f64,
++    pub glass_focus_scrim_above: f64,
++    pub glass_focus_scrim_below: f64,
+     pub noise: Option<f64>,
+     pub saturation: Option<f64>,
+ }
+@@ -42,6 +65,7 @@ impl Options {
+     fn is_visible(&self) -> bool {
+         self.xray
+             || self.blur
++            || self.glass
+             || self.noise.is_some_and(|x| x > 0.)
+             || self.saturation.is_some_and(|x| x != 1.)
+     }
+@@ -81,6 +105,44 @@ niri_render_elements! {
+     }
+ }
+ 
++/// Murano register (R113): every glass body publishes its screen-space
++/// rect here (x0, y0, x1, y1, radius); each render pass reads the
++/// R175: wie viele Glaskoerper EINE Flaeche gleichzeitig tragen kann.
++/// Das Dock hat 15-17 Kacheln; 24 laesst Luft, ohne die Uniform-Budgets
++/// kleiner GPUs zu sprengen.
++pub const GLASS_BODIES: usize = 24;
++
++/// Namen der Array-Uniforms. GL sucht Array-Elemente einzeln per
++/// "name[i]" — daher eine Tabelle statt Laufzeit-Formatierung,
++/// UniformName braucht &'static str.
++pub const GLASS_BODY_NAMES: [&str; GLASS_BODIES] = ["glass_body[0]", "glass_body[1]", "glass_body[2]", "glass_body[3]", "glass_body[4]", "glass_body[5]", "glass_body[6]", "glass_body[7]", "glass_body[8]", "glass_body[9]", "glass_body[10]", "glass_body[11]", "glass_body[12]", "glass_body[13]", "glass_body[14]", "glass_body[15]", "glass_body[16]", "glass_body[17]", "glass_body[18]", "glass_body[19]", "glass_body[20]", "glass_body[21]", "glass_body[22]", "glass_body[23]"];
++pub const GLASS_BODY_RADIUS_NAMES: [&str; GLASS_BODIES] = ["glass_body_radius[0]", "glass_body_radius[1]", "glass_body_radius[2]", "glass_body_radius[3]", "glass_body_radius[4]", "glass_body_radius[5]", "glass_body_radius[6]", "glass_body_radius[7]", "glass_body_radius[8]", "glass_body_radius[9]", "glass_body_radius[10]", "glass_body_radius[11]", "glass_body_radius[12]", "glass_body_radius[13]", "glass_body_radius[14]", "glass_body_radius[15]", "glass_body_radius[16]", "glass_body_radius[17]", "glass_body_radius[18]", "glass_body_radius[19]", "glass_body_radius[20]", "glass_body_radius[21]", "glass_body_radius[22]", "glass_body_radius[23]"];
++
++/// neighbors and hands them to the shader for the smooth-minimum
++/// union. Entries age out so unmapped surfaces disappear.
++fn glass_field() -> &'static Mutex<HashMap<usize, ([f32; 5], Instant)>> {
++    static FIELD: OnceLock<Mutex<HashMap<usize, ([f32; 5], Instant)>>> = OnceLock::new();
++    FIELD.get_or_init(|| Mutex::new(HashMap::new()))
++}
++
++/// R195: logical size of the output being rendered, set once per output
++/// render pass (same ambient style as the Murano register — rendering
++/// is single-pass per output, so the last writer is the current one).
++/// The focus pane needs the screen center; threading the output through
++/// every render signature would touch half the tree for one number.
++fn view_size_cell() -> &'static Mutex<(f64, f64)> {
++    static SIZE: OnceLock<Mutex<(f64, f64)>> = OnceLock::new();
++    SIZE.get_or_init(|| Mutex::new((0.0, 0.0)))
++}
++
++pub fn set_view_size(w: f64, h: f64) {
++    *view_size_cell().lock().unwrap() = (w, h);
++}
++
++fn view_size() -> (f64, f64) {
++    *view_size_cell().lock().unwrap()
++}
++
+ impl BackgroundEffect {
+     pub fn new() -> Self {
+         Self {
+@@ -124,13 +186,44 @@ impl BackgroundEffect {
+         let mut options = Options {
+             blur,
+             xray: effect.xray == Some(true),
++            glass: effect.glass == Some(true),
++            glass_inset: effect.glass_inset.unwrap_or(0.),
++            glass_band: effect.glass_band.unwrap_or(16.),
++            glass_bend: effect.glass_bend.unwrap_or(10.),
++            glass_scrim: effect.glass_scrim.unwrap_or(0.35),
++            glass_fade: 1.0,
++            glass_shadow: effect.glass_shadow.unwrap_or(0.55),
++            glass_shadow_spread: effect.glass_shadow_spread.unwrap_or(14.),
++            glass_inset_x: effect
++                .glass_inset_x
++                .or(effect.glass_inset)
++                .unwrap_or(0.),
++            glass_inset_y: effect
++                .glass_inset_y
++                .or(effect.glass_inset)
++                .unwrap_or(0.),
++            glass_height: effect.glass_height.unwrap_or(0.),
++            glass_anchor_top: effect.glass_anchor_top == Some(true),
++            glass_union: effect.glass_union.unwrap_or(24.),
++            glass_focus: effect.glass_focus.unwrap_or(0.),
++            glass_focus_keep: effect.glass_focus_keep.unwrap_or(0.),
++            glass_focus_center: effect.glass_focus_center.unwrap_or(0.5),
++            glass_focus_scrim_above: effect.glass_focus_scrim_above.unwrap_or(0.),
++            glass_focus_scrim_below: effect.glass_focus_scrim_below.unwrap_or(0.),
+             noise: effect.noise,
+             saturation: effect.saturation,
+         };
+ 
++        // Glass refracts the real scene: it needs the true framebuffer
++        // (never the cheap xray path) and blur for the frosted body.
++        if options.glass {
++            options.xray = false;
++            options.blur = true;
++        }
++
+         // If we have some background effect but xray wasn't explicitly set, default it to true
+-        // since it's cheaper.
+-        if options.is_visible() && effect.xray.is_none() {
++        // since it's cheaper. Glass already pinned xray off above.
++        if options.is_visible() && effect.xray.is_none() && !options.glass {
+             options.xray = true;
+         }
+ 
+@@ -154,6 +247,7 @@ impl BackgroundEffect {
+         ns: Option<usize>,
+         mut params: RenderParams,
+         xray_pos: XrayPos,
++        field_key: usize,
+         push: &mut dyn FnMut(BackgroundEffectElement),
+     ) {
+         if !self.is_visible() {
+@@ -196,10 +290,155 @@ impl BackgroundEffect {
+                 &mut |elem| push(elem.into()),
+             );
+         } else {
++            // R168f: a folded auto-hide strip must not wear the glass
++            // body — below this height the surface is a catch strip,
++            // not a panel. Kills the ghost stripe at the screen edge.
++            let glass_active = self.options.glass && params.geometry.size.h >= 24.0;
++            // The pane inside the surface: per-axis insets, optionally a
++            // fixed anchored height. Computed ONCE here — the Murano
++            // register and the shader uniforms must describe the same
++            // rectangle, or unions and shadows drift apart.
++            let g = params.geometry;
++            let (pane_ix, pane_y0, pane_y1, pane_scrim) = {
++                let ix = self.options.glass_inset_x;
++                let iy = self.options.glass_inset_y;
++                let (y0, y1) = if self.options.glass_height > 0.0 {
++                    if self.options.glass_anchor_top {
++                        (iy, iy + self.options.glass_height)
++                    } else {
++                        (g.size.h - iy - self.options.glass_height, g.size.h - iy)
++                    }
++                } else {
++                    (iy, g.size.h - iy)
++                };
++                // R195: the pane follows the wheel focus of the Raum.
++                // Same phase as raum.rs (distance of the body center
++                // from the screen center, vertical): the content in the
++                // body scales with focus, so the glass must scale with
++                // it — anchored on ITS CENTER on both axes (R198: the
++                // content sits centered in the shell, so measurement
++                // slack splits evenly and both gaps stay equal), with a
++                // keep-zone for the padding that does not scale.
++                if glass_active && self.options.glass_focus > 0.0 {
++                    let (_vw, vh) = view_size();
++                    if vh > 1.0 {
++                        let center = g.loc.y + (y0 + y1) * 0.5;
++                        // R203: the focus lives where the config puts
++                        // it (the Raum: 0.40 — above center). Each
++                        // side is normalized to ITS OWN run, and the
++                        // pane darkens as it leaves the focus:
++                        // gently above, strongly below — down there
++                        // it passes BEHIND the dock and must yield.
++                        let fokus_y = vh * self.options.glass_focus_center;
++                        let below = center > fokus_y;
++                        let run = if below { vh - fokus_y } else { fokus_y };
++                        let phase =
++                            (1.0 - (center - fokus_y).abs() / run.max(1.0)).clamp(0.0, 1.0);
++                        let ramp = if below {
++                            self.options.glass_focus_scrim_below
++                        } else {
++                            self.options.glass_focus_scrim_above
++                        };
++                        let scrim =
++                            (self.options.glass_scrim + ramp * (1.0 - phase)).min(0.92);
++                        let s = (1.0 - self.options.glass_focus)
++                            + self.options.glass_focus * phase;
++                        let w = (g.size.w - 2.0 * ix).max(0.0);
++                        let h = (y1 - y0).max(0.0);
++                        let keep_w = self.options.glass_focus_keep.min(w);
++                        let keep_h = self.options.glass_focus_keep.min(h);
++                        let ew = keep_w + (w - keep_w) * s;
++                        let eh = keep_h + (h - keep_h) * s;
++                        let ny0 = y0 + (h - eh) * 0.5;
++                        ((g.size.w - ew) * 0.5, ny0, ny0 + eh, scrim)
++                    } else {
++                        (ix, y0, y1, self.options.glass_scrim)
++                    }
++                } else {
++                    (ix, y0, y1, self.options.glass_scrim)
++                }
++            };
++            // Murano register (R113): publish this body, read the
++            // neighbors — the shader merges them into one field.
++            let mut glass_union = 0.0f32;
++            let mut glass_others = [[0.0f32; 4]; GLASS_BODIES];
++            let mut glass_other_radius = [0.0f32; GLASS_BODIES];
++            // Union 0 = solitary glass (R125): the body stays OUT of
++            // the Murano register — popup cards must never melt into
++            // the bar or dock they open next to.
++            if glass_active && self.options.glass_union > 0.0 {
++                let ix = pane_ix;
++                let (y0, y1) = (pane_y0, pane_y1);
++                let cr = <[f32; 4]>::from(self.corner_radius);
++                let r = cr.iter().fold(0.0f32, |a, b| a.max(*b));
++                let body = [
++                    (g.loc.x + ix) as f32,
++                    (g.loc.y + y0) as f32,
++                    (g.loc.x + g.size.w - ix) as f32,
++                    (g.loc.y + y1) as f32,
++                    r,
++                ];
++                let now = Instant::now();
++                let mut field = glass_field().lock().unwrap();
++                field.retain(|_, (_, t)| now.duration_since(*t).as_millis() < 500);
++                field.insert(field_key, (body, now));
++                glass_union = self.options.glass_union as f32;
++                // Phase 1.1 (bar-menu finding 2026-07-23): only NEAR
++                // bodies merge. A veil-sized surface would otherwise
++                // fold distant panels into its field and refract
++                // their silhouettes across the screen.
++                let near = 4.0 * glass_union.max(1.0);
++                let mut idx = 0;
++                for (k, (b, _)) in field.iter() {
++                    if *k != field_key && idx < GLASS_BODIES {
++                        let dx = (b[0] - body[2]).max(body[0] - b[2]).max(0.0);
++                        let dy = (b[1] - body[3]).max(body[1] - b[3]).max(0.0);
++                        if (dx * dx + dy * dy).sqrt() > near {
++                            continue;
++                        }
++                        glass_others[idx] = [
++                            b[0] - g.loc.x as f32,
++                            b[1] - g.loc.y as f32,
++                            b[2] - g.loc.x as f32,
++                            b[3] - g.loc.y as f32,
++                        ];
++                        glass_other_radius[idx] = b[4];
++                        idx += 1;
++                    }
++                }
++            }
++
+             // Render non-xray effect.
+             let elem = self
+                 .nonxray
+-                .render(ns, params, blur_options, noise, saturation);
++                .render(
++                    ns,
++                    params,
++                    blur_options,
++                    noise,
++                    saturation,
++                    glass_active,
++                    [
++                        // The pane goes to the shader in ONE canonical
++                        // form — top offset + height — so the focus
++                        // scaling above needs no shader-side twin. For
++                        // rules without focus this is algebraically the
++                        // same rectangle as the raw inset/anchor form.
++                        pane_ix as f32,
++                        pane_y0 as f32,
++                        self.options.glass_band as f32,
++                        self.options.glass_bend as f32,
++                        pane_scrim as f32,
++                        self.options.glass_shadow as f32,
++                        self.options.glass_shadow_spread as f32,
++                        (pane_y1 - pane_y0) as f32,
++                        1.0,
++                        self.options.glass_fade,
++                    ],
++                    glass_union,
++                    glass_others,
++                    glass_other_radius,
++                );
+             push(elem.into());
+         }
+     }
+@@ -293,6 +532,7 @@ pub fn render_for_tile(
+     blur_config: niri_config::Blur,
+     radius: CornerRadius,
+     effect: niri_config::BackgroundEffect,
++    fade: f32,
+     should_block_out: bool,
+     xray_pos: XrayPos,
+     push: &mut dyn FnMut(BackgroundEffectElement),
+@@ -306,6 +546,8 @@ pub fn render_for_tile(
+ 
+         background_effect.update_config(blur_config);
+         background_effect.update_render_elements(radius, effect, has_blur_region);
++        // Matrix R128: per-frame appearance fade from the pop spring.
++        background_effect.options.glass_fade = fade;
+ 
+         if !background_effect.is_visible() {
+             return;
+@@ -327,6 +569,13 @@ pub fn render_for_tile(
+         };
+ 
+         let xray_pos = xray_pos.offset(params.geometry.loc - geometry.loc);
+-        background_effect.render(ctx, ns, params, xray_pos, push);
++        // Murano register key: stable per wl_surface.
++        let field_key = {
++            use std::hash::{Hash, Hasher};
++            let mut h = std::collections::hash_map::DefaultHasher::new();
++            surface.id().hash(&mut h);
++            h.finish() as usize
++        };
++        background_effect.render(ctx, ns, params, xray_pos, field_key, push);
+     });
+ }
+diff --git a/src/render_helpers/framebuffer_effect.rs b/src/render_helpers/framebuffer_effect.rs
+index 4dc529d..1c7657e 100644
+--- a/src/render_helpers/framebuffer_effect.rs
++++ b/src/render_helpers/framebuffer_effect.rs
+@@ -38,6 +38,16 @@ pub struct FramebufferEffectElement {
+     blur_options: Option<BlurOptions>,
+     noise: f32,
+     saturation: f32,
++    glass: bool,
++    /// [inset_x, inset_y, band, bend, scrim, shadow, spread, height,
++    /// anchor_top] — px unless noted, see the rule docs.
++    glass_params: [f32; 10],
++    /// Murano register (R113): smin distance + up to four neighbor
++    /// bodies in THIS surface's local logical space (x0, y0, x1, y1;
++    /// x1 <= x0 = unused slot) with their radii.
++    glass_union: f32,
++    glass_others: [[f32; 4]; super::background_effect::GLASS_BODIES],
++    glass_other_radius: [f32; super::background_effect::GLASS_BODIES],
+ }
+ 
+ #[derive(Debug)]
+@@ -68,6 +78,11 @@ impl FramebufferEffect {
+         blur_options: Option<BlurOptions>,
+         noise: f32,
+         saturation: f32,
++        glass: bool,
++        glass_params: [f32; 10],
++        glass_union: f32,
++        glass_others: [[f32; 4]; super::background_effect::GLASS_BODIES],
++        glass_other_radius: [f32; super::background_effect::GLASS_BODIES],
+     ) -> FramebufferEffectElement {
+         let (clip_geo, corner_radius) = params
+             .clip
+@@ -89,6 +104,11 @@ impl FramebufferEffect {
+             blur_options,
+             noise,
+             saturation,
++            glass,
++            glass_params,
++            glass_union,
++            glass_others,
++            glass_other_radius,
+         }
+     }
+ }
+@@ -98,7 +118,7 @@ impl FramebufferEffectElement {
+         &self,
+         crop: Rectangle<f64, Logical>,
+         transform: Transform,
+-    ) -> [Uniform<'static>; 7] {
++    ) -> Vec<Uniform<'static>> {
+         let offset = crop.loc - (self.clip_geo.loc - self.geometry.loc);
+         let offset = Vec2::new(offset.x as f32, offset.y as f32);
+         let crop_size = Vec2::new(crop.size.w as f32, crop.size.h as f32);
+@@ -116,15 +136,42 @@ impl FramebufferEffectElement {
+ 
+         let clip_geo_size = (self.clip_geo.size.w as f32, self.clip_geo.size.h as f32);
+ 
+-        [
++        let mut uniforms = vec![
+             Uniform::new("niri_scale", self.scale),
+             Uniform::new("geo_size", clip_geo_size),
+             Uniform::new("corner_radius", <[f32; 4]>::from(self.corner_radius)),
+             mat3_uniform("input_to_geo", input_to_clip_geo),
+             Uniform::new("noise", self.noise),
+             Uniform::new("saturation", self.saturation),
+-            Uniform::new("bg_color", [0f32, 0., 0., 0.]),
+-        ]
++        ];
++        if self.glass {
++            // The glass shader walks back from geo space to sample coords.
++            uniforms.push(mat3_uniform(
++                "geo_to_input",
++                input_to_clip_geo.inverse(),
++            ));
++            uniforms.push(Uniform::new("glass_inset_x", self.glass_params[0]));
++            uniforms.push(Uniform::new("glass_inset_y", self.glass_params[1]));
++            uniforms.push(Uniform::new("glass_band", self.glass_params[2]));
++            uniforms.push(Uniform::new("glass_bend", self.glass_params[3]));
++            uniforms.push(Uniform::new("glass_scrim", self.glass_params[4]));
++            uniforms.push(Uniform::new("glass_shadow", self.glass_params[5]));
++            uniforms.push(Uniform::new("glass_shadow_spread", self.glass_params[6]));
++            uniforms.push(Uniform::new("glass_height", self.glass_params[7]));
++            uniforms.push(Uniform::new("glass_anchor_top", self.glass_params[8]));
++            uniforms.push(Uniform::new("glass_fade", self.glass_params[9]));
++            uniforms.push(Uniform::new("glass_union", self.glass_union));
++            for (i, body) in self.glass_others.iter().enumerate() {
++                uniforms.push(Uniform::new(super::background_effect::GLASS_BODY_NAMES[i], *body));
++                uniforms.push(Uniform::new(
++                    super::background_effect::GLASS_BODY_RADIUS_NAMES[i],
++                    self.glass_other_radius[i],
++                ));
++            }
++        } else {
++            uniforms.push(Uniform::new("bg_color", [0f32, 0., 0., 0.]));
++        }
++        uniforms
+     }
+ }
+ 
+@@ -388,7 +435,17 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
+             clamped_dst.size.to_f64().upscale(dst_to_src).to_logical(1.),
+         );
+ 
+-        let program = Shaders::get_from_frame(frame).postprocess_and_clip.clone();
++        let shaders = Shaders::get_from_frame(frame);
++        let program = if self.glass {
++            // Liquid glass (R106): refract the captured backdrop. Fall back
++            // to the plain postprocess path if the shader failed to compile.
++            shaders
++                .glass_and_clip
++                .clone()
++                .or_else(|| shaders.postprocess_and_clip.clone())
++        } else {
++            shaders.postprocess_and_clip.clone()
++        };
+         let uniforms = program
+             .is_some()
+             .then(|| self.compute_uniforms(crop, frame.transformation()));
+diff --git a/src/render_helpers/shaders/glass.frag b/src/render_helpers/shaders/glass.frag
+new file mode 100644
+index 0000000..ad00d89
+--- /dev/null
++++ b/src/render_helpers/shaders/glass.frag
+@@ -0,0 +1,249 @@
++#version 100
++
++//_DEFINES_
++
++#if defined(EXTERNAL)
++#extension GL_OES_EGL_image_external : require
++#endif
++
++precision highp float;
++#if defined(EXTERNAL)
++uniform samplerExternalOES tex;
++#else
++uniform sampler2D tex;
++#endif
++
++// Liquid glass (Matrix R106) — the empirical extract of macOS 27's
++// backdrop machinery, measured on the living system:
++//   * CABackdropLayer captures the real scene behind the region
++//     (here: niri's framebuffer copy, pre-blurred by the Kawase chain),
++//   * a rounded-rect SDF shapes the body; refraction bends the sample
++//     coordinates along the SDF gradient, strongest in a rim band,
++//   * chromatic fringe = per-channel bend scales 1.15 / 1.0 / 0.85,
++//   * rim light against the fixed top-left key light, soft inner shade.
++// Coordinates: v_coords are [0,1] in the crop; input_to_geo lifts them
++// to [0,1] inside the clip geometry, geo_to_input walks back so bent
++// positions can be sampled from the texture.
++
++uniform float alpha;
++varying vec2 v_coords;
++
++#if defined(DEBUG_FLAGS)
++uniform float tint;
++#endif
++
++uniform float niri_scale;
++uniform vec2 geo_size;
++uniform vec4 corner_radius;
++uniform mat3 input_to_geo;
++uniform mat3 geo_to_input;
++uniform float glass_inset_x;
++uniform float glass_inset_y;
++uniform float glass_height;
++uniform float glass_anchor_top;
++uniform float glass_band;
++uniform float glass_bend;
++uniform float glass_scrim;
++uniform float glass_fade;
++uniform float glass_shadow;
++uniform float glass_shadow_spread;
++// Murano register (R113): up to four OTHER glass bodies on screen,
++// already transformed into THIS surface's local logical space
++// (x0, y0, x1, y1; x1 <= x0 marks an unused slot). glass_union is the
++// smooth-minimum distance — 0 switches the merge off.
++uniform float glass_union;
++// R175: eine LISTE von Koerpern statt vier fester Plaetze. Ein leerer
++// Platz traegt x1 <= x0, die Schleife ueberspringt ihn.
++#define GLASS_BODIES 24
++uniform vec4 glass_body[GLASS_BODIES];
++uniform float glass_body_radius[GLASS_BODIES];
++uniform float noise;
++uniform float saturation;
++
++float niri_rounding_alpha(vec2 coords, vec2 size, vec4 corner_radius);
++
++// One neighbor body folded into the field (polynomial smooth minimum).
++float glass_union_sdf(float d, vec2 p, vec4 o, float r) {
++    if (o.z <= o.x) {
++        return d;
++    }
++    vec2 c = (o.xy + o.zw) * 0.5;
++    vec2 h = (o.zw - o.xy) * 0.5;
++    float rr = min(r, min(h.x, h.y));
++    vec2 a = abs(p - c) - h + vec2(rr);
++    float od = length(max(a, 0.0)) + min(max(a.x, a.y), 0.0) - rr;
++    float k = glass_union;
++    float m = clamp(0.5 + 0.5 * (od - d) / k, 0.0, 1.0);
++    return mix(od, d, m) - k * m * (1.0 - m);
++}
++
++// Sin-less white noise by David Hoskins (MIT License).
++// https://www.shadertoy.com/view/4djSRW
++float glass_hash12(vec2 p) {
++    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
++    p3 += dot(p3, p3.yzx + 33.33);
++    return fract((p3.x + p3.y) * p3.z);
++}
++
++// Signed distance of the clip rounded-rect, per-quadrant radius
++// (corner_radius = top-left, top-right, bottom-right, bottom-left).
++float glass_sdf(vec2 p) {
++    // The glass body hugs the pill. Surfaces grow for menus — the body
++    // must not: with glass_height set, it keeps a fixed height anchored
++    // at the top or bottom edge (per-axis insets for one-sided shadow
++    // room, e.g. the bar).
++    float y0;
++    float y1;
++    if (glass_height > 0.0) {
++        if (glass_anchor_top > 0.5) {
++            y0 = glass_inset_y;
++            y1 = glass_inset_y + glass_height;
++        } else {
++            y1 = geo_size.y - glass_inset_y;
++            y0 = y1 - glass_height;
++        }
++    } else {
++        y0 = glass_inset_y;
++        y1 = geo_size.y - glass_inset_y;
++    }
++    vec2 center = vec2(geo_size.x * 0.5, (y0 + y1) * 0.5);
++    vec2 half_size = vec2(geo_size.x * 0.5 - glass_inset_x, (y1 - y0) * 0.5);
++    vec2 q = p - center;
++    float r;
++    if (q.x < 0.0) {
++        r = (q.y < 0.0) ? corner_radius.x : corner_radius.w;
++    } else {
++        r = (q.y < 0.0) ? corner_radius.y : corner_radius.z;
++    }
++    vec2 a = abs(q) - half_size + vec2(r);
++    float d = length(max(a, 0.0)) + min(max(a.x, a.y), 0.0) - r;
++    // Murano union: fold the neighbors in via smooth minimum — the
++    // field is ONE poured form, so rim, refraction and shadow follow
++    // a merged silhouette wherever two panels come close.
++    if (glass_union > 0.0) {
++        for (int i = 0; i < GLASS_BODIES; i++) {
++            d = glass_union_sdf(d, p, glass_body[i], glass_body_radius[i]);
++        }
++    }
++    return d;
++}
++
++vec2 glass_sample_coords(vec2 p) {
++    vec3 back = geo_to_input * vec3(p / geo_size, 1.0);
++    return back.xy;
++}
++
++vec3 glass_saturate(vec3 color, float sat) {
++    const vec3 w = vec3(0.2126, 0.7152, 0.0722);
++    return mix(vec3(dot(color, w)), color, sat);
++}
++
++void main() {
++    vec3 coords_geo = input_to_geo * vec3(v_coords, 1.0);
++    vec2 p = coords_geo.xy * geo_size;
++
++    float d = glass_sdf(p);
++
++    // SDF gradient by central differences — the refraction normal.
++    float e = 1.0;
++    vec2 grad = vec2(
++        glass_sdf(p + vec2(e, 0.0)) - glass_sdf(p - vec2(e, 0.0)),
++        glass_sdf(p + vec2(0.0, e)) - glass_sdf(p - vec2(0.0, e)));
++    grad = normalize(grad + vec2(1e-5));
++
++    // Rim band: 0 deep inside, 1 at the edge (d is negative inside).
++    // Calibration (user finding, red wallpaper 2026-07-22): the first
++    // proportional band (35% of the pill) smeared bright content deep
++    // into the body. macOS keeps the lens a thin constant ring. Both
++    // knobs come from the layer rule and are live-tunable there.
++    float rim = clamp(1.0 + d / glass_band, 0.0, 1.0);
++    rim = rim * rim;
++
++    float bend = glass_bend * rim;
++
++    // Chromatic fringe: three samples, per-channel bend scales.
++    vec4 cr = texture2D(tex, glass_sample_coords(p - grad * bend * 1.15));
++    vec4 cg = texture2D(tex, glass_sample_coords(p - grad * bend));
++    vec4 cb = texture2D(tex, glass_sample_coords(p - grad * bend * 0.85));
++    vec4 color = vec4(cr.r, cg.g, cb.b, 1.0);
++
++    if (saturation != 1.0) {
++        color.rgb = glass_saturate(color.rgb, saturation);
++    }
++
++    // Legibility limiter (macOS limitAveragePixelLuminance, in-pass):
++    // the glass measures its own frosted brightness and darkens
++    // proportionally, so light panel text keeps contrast on bright
++    // backdrops. Zero effect on dark scenes.
++    if (glass_scrim > 0.0) {
++        float lum = dot(color.rgb, vec3(0.2126, 0.7152, 0.0722));
++        float over = smoothstep(0.55, 0.95, lum);
++        color.rgb *= 1.0 - over * glass_scrim;
++    }
++
++    // R174g: the reference lights its glass along an AXIS, not from a
++    // corner. On macOS 27 and iPadOS the bright rim runs across the
++    // TOP AND THE BOTTOM edge while the left and right flanks stay
++    // dark (user, comparing both systems side by side). A directional
++    // key light cannot do that — it lights two ADJACENT edges, which
++    // is exactly what we had: left and top.
++    //
++    // So the term reads the gradient's vertical share instead of a
++    // light vector. The top keeps the stronger rim (the light still
++    // comes from above), the bottom catches the softer bounce, and
++    // the flanks get the shade.
++    float up = -grad.y;
++    float horizon = abs(up);
++    float flank = abs(grad.x);
++    float rim_edge = pow(rim, 3.0);
++    float lit = horizon * mix(0.72, 1.0, step(0.0, up));
++    color.rgb += rim_edge * lit * 0.22;
++    color.rgb -= rim_edge * flank * 0.08;
++
++    // Fine grain keeps the frost from banding (macOS noise floor).
++    if (noise > 0.0) {
++        color.rgb += (glass_hash12(gl_FragCoord.xy) - 0.5) * noise;
++    }
++
++    // Outside the pill body the glass vanishes; in its place the DROP
++    // SHADOW rises from the SAME distance field (shape family phase A):
++    // a gaussian of the distance, offset downward like the key light
++    // demands. One shape, one truth — an abrupt shadow edge is
++    // structurally impossible, and the app paints no ring of its own.
++    float coverage = 1.0 - smoothstep(-1.0, 1.0, d);
++    color = color * coverage;
++
++    if (glass_shadow > 0.0) {
++        float ds = glass_sdf(p - vec2(0.0, 4.0));
++        float sigma = max(glass_shadow_spread, 1.0);
++        float fall = exp(-(max(ds, 0.0) * max(ds, 0.0)) / (2.0 * sigma * sigma));
++        // The surface rectangle would amputate the gaussian (user
++        // finding: dark wedges at the bar ends, boxy halo around the
++        // dock). Fade to ZERO toward every surface edge, so however
++        // little room a side reserves, the tail always lands softly.
++        float d_edge = min(min(p.x, geo_size.x - p.x), min(p.y, geo_size.y - p.y));
++        float edge_fade = smoothstep(0.0, 10.0, d_edge);
++        float shadow_a = glass_shadow * fall * edge_fade * (1.0 - coverage);
++        // Premultiplied black: alpha only, the body keeps its color.
++        color.a = min(color.a + shadow_a, 1.0);
++    }
++
++    if (coords_geo.x < 0.0 || 1.0 < coords_geo.x || coords_geo.y < 0.0 || 1.0 < coords_geo.y) {
++        // Clip outside geometry.
++        color = vec4(0.0);
++    } else {
++        // Apply corner rounding inside geometry.
++        color = color * niri_rounding_alpha(coords_geo.xy * geo_size, geo_size, corner_radius);
++    }
++
++    color = color * alpha;
++
++#if defined(DEBUG_FLAGS)
++    if (tint == 1.0)
++        color = vec4(0.0, 0.2, 0.0, 0.2) + color * 0.8;
++#endif
++
++    // Matrix R128: appearance fade — the glass must not show
++    // before the client painted content (premultiplied output).
++    gl_FragColor = color * glass_fade;
++}
+diff --git a/src/render_helpers/shaders/mod.rs b/src/render_helpers/shaders/mod.rs
+index 7be9b15..8c07351 100644
+--- a/src/render_helpers/shaders/mod.rs
++++ b/src/render_helpers/shaders/mod.rs
+@@ -15,6 +15,7 @@ pub struct Shaders {
+     pub shadow: Option<ShaderProgram>,
+     pub clipped_surface: Option<GlesTexProgram>,
+     pub postprocess_and_clip: Option<GlesTexProgram>,
++    pub glass_and_clip: Option<GlesTexProgram>,
+     pub resize: Option<ShaderProgram>,
+     pub gradient_fade: Option<GlesTexProgram>,
+     pub blur: Option<BlurProgram>,
+@@ -126,6 +127,86 @@ impl Shaders {
+             })
+             .ok();
+ 
++        let glass_and_clip = renderer
++            .compile_custom_texture_shader(
++                concat!(
++                    include_str!("glass.frag"),
++                    include_str!("rounding_alpha.frag"),
++                ),
++                &[
++                    UniformName::new("niri_scale", UniformType::_1f),
++                    UniformName::new("geo_size", UniformType::_2f),
++                    UniformName::new("corner_radius", UniformType::_4f),
++                    UniformName::new("input_to_geo", UniformType::Matrix3x3),
++                    UniformName::new("geo_to_input", UniformType::Matrix3x3),
++                    UniformName::new("glass_inset_x", UniformType::_1f),
++                    UniformName::new("glass_inset_y", UniformType::_1f),
++                    UniformName::new("glass_band", UniformType::_1f),
++                    UniformName::new("glass_bend", UniformType::_1f),
++                    UniformName::new("glass_scrim", UniformType::_1f),
++                    UniformName::new("glass_fade", UniformType::_1f),
++                    UniformName::new("glass_shadow", UniformType::_1f),
++                    UniformName::new("glass_shadow_spread", UniformType::_1f),
++                    UniformName::new("glass_height", UniformType::_1f),
++                    UniformName::new("glass_anchor_top", UniformType::_1f),
++                    UniformName::new("glass_union", UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[0], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[0], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[1], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[1], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[2], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[2], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[3], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[3], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[4], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[4], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[5], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[5], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[6], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[6], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[7], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[7], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[8], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[8], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[9], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[9], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[10], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[10], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[11], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[11], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[12], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[12], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[13], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[13], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[14], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[14], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[15], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[15], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[16], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[16], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[17], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[17], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[18], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[18], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[19], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[19], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[20], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[20], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[21], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[21], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[22], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[22], UniformType::_1f),
++                    UniformName::new(super::background_effect::GLASS_BODY_NAMES[23], UniformType::_4f),
++                    UniformName::new(super::background_effect::GLASS_BODY_RADIUS_NAMES[23], UniformType::_1f),
++                    UniformName::new("noise", UniformType::_1f),
++                    UniformName::new("saturation", UniformType::_1f),
++                ],
++            )
++            .map_err(|err| {
++                warn!("error compiling glass shader: {err:?}");
++            })
++            .ok();
++
+         let resize = compile_resize_program(renderer, include_str!("resize.frag"))
+             .map_err(|err| {
+                 warn!("error compiling resize shader: {err:?}");
+@@ -153,6 +234,7 @@ impl Shaders {
+             shadow,
+             clipped_surface,
+             postprocess_and_clip,
++            glass_and_clip,
+             resize,
+             gradient_fade,
+             blur,
+diff --git a/src/render_helpers/surface.rs b/src/render_helpers/surface.rs
+index 629a65c..d63ba17 100644
+--- a/src/render_helpers/surface.rs
++++ b/src/render_helpers/surface.rs
+@@ -136,6 +136,10 @@ pub fn push_elements_from_surface_tree<R>(
+                         Ok(None) => {} // surface is not mapped
+                         Err(err) => {
+                             warn!("failed to import surface: {}", err);
++                            crate::niri::Niri::matrix_frame_trace(&format!(
++                                "import-fail {:?}: {err}",
++                                smithay::reexports::wayland_server::Resource::id(surface)
++                            ));
+                         }
+                     };
+                 }
+diff --git a/src/window/mapped.rs b/src/window/mapped.rs
+index 3db1f66..0a2a0b0 100644
+--- a/src/window/mapped.rs
++++ b/src/window/mapped.rs
+@@ -730,6 +730,7 @@ impl LayoutElement for Mapped {
+                 self.blur_config,
+                 popup_rules.geometry_corner_radius.unwrap_or_default(),
+                 effect,
++                1.0,
+                 false,
+                 xray_pos,
+                 &mut |elem| push(elem.into()),
+@@ -761,6 +762,7 @@ impl LayoutElement for Mapped {
+             self.blur_config,
+             radius,
+             self.rules.background_effect,
++            1.0,
+             should_block_out,
+             xray_pos,
+             push,

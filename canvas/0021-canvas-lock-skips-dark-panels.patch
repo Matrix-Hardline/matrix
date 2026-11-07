@@ -1,0 +1,28 @@
+diff --git a/src/niri.rs b/src/niri.rs
+index 4b4746b..086521f 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -2986,8 +2986,8 @@ impl Niri {
+                 // We're locking and an output was removed, check if the requirements are now met.
+                 let all_locked = self
+                     .output_state
+-                    .values()
+-                    .all(|state| state.lock_render_state == LockRenderState::Locked);
++                    .iter()
++                    .all(|(o, state)| state.lock_render_state == LockRenderState::Locked || self.dark_outputs.contains(&o.name()));
+ 
+                 if all_locked {
+                     let lock = confirmation.ext_session_lock().clone();
+@@ -4805,8 +4805,10 @@ impl Niri {
+                     // Check if all outputs are now locked.
+                     let all_locked = self
+                         .output_state
+-                        .values()
+-                        .all(|state| state.lock_render_state == LockRenderState::Locked);
++                        .iter()
++                        // Matrix 0021: a panel switched off on its own (0017)
++                        // never draws — it holds nothing to hide, it counts.
++                        .all(|(o, state)| state.lock_render_state == LockRenderState::Locked || self.dark_outputs.contains(&o.name()));
+ 
+                     if all_locked {
+                         // All outputs are locked, report success.

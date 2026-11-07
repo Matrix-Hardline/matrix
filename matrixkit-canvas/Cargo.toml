@@ -1,0 +1,15 @@
+[package]
+name = "matrixkit-canvas"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+description = "Matrix Vektormaschine — tiny-skia aus erster Hand: Pfade ziehen, füllen, in den Puffer mischen"
+
+[dependencies]
+matrixkit-theme = { path = "../matrixkit-theme" }
+tiny-skia = "0.11"
+# Lager 62: SVG first-hand — the same foundation that also lies under
+# iced's svg widget (resvg/usvg), used directly instead of through
+# an intermediary. Both have long been in the vendor tree.
+usvg = "0.45"
+resvg = "0.45"

@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["apps/bar", "apps/camera", "apps/capture", "apps/central", "apps/context", "apps/dock", "apps/files", "apps/greeter", "apps/help", "apps/keyboard", "apps/krabbler", "apps/lock", "apps/morpheus-duo", "apps/notifications", "apps/player", "apps/settings", "apps/shopping", "apps/start", "apps/terminal", "apps/trust", "apps/tube", "apps/wallpaper", "matrixkit-canvas", "matrixkit-gpu", "matrixkit-icons", "matrixkit-image", "matrixkit-scene", "matrixkit-shell", "matrixkit-text", "matrixkit-theme", "matrixkit-tube", "matrixkit-video", "matrixkit-widgets"]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[profile.release]
+lto = true
+strip = true
+
+# Für kleine Rechner: derselbe Code ohne Fat-LTO.
+[profile.werkbank]
+inherits = "release"
+lto = false
+codegen-units = 16
+
+[patch.crates-io]
+layershellev = { path = "vendor/layershellev" }
+iced_layershell = { path = "vendor/iced_layershell" }

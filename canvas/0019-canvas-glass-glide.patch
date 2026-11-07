@@ -1,0 +1,198 @@
+diff --git a/niri-config/src/appearance.rs b/niri-config/src/appearance.rs
+index 4af29f4..b52c906 100644
+--- a/niri-config/src/appearance.rs
++++ b/niri-config/src/appearance.rs
+@@ -1097,6 +1097,15 @@ pub struct BackgroundEffectRule {
+     /// surface appears — for solitary glass cards (menus, Zentrale).
+     #[knuffel(child, unwrap(argument))]
+     pub glass_pop: Option<bool>,
++    /// Matrix (0019): glide the glass body to a new place or size over this
++    /// many milliseconds instead of jumping (the bar's chips flowing into
++    /// the notification island). 0 / absent = jump.
++    #[knuffel(child, unwrap(argument))]
++    pub glass_glide: Option<FloatOrInt<0, 5000>>,
++    /// Matrix (0019): while gliding TOGETHER the bodies melt (Murano union
++    /// ramped up to this distance), gliding APART they let go again.
++    #[knuffel(child, unwrap(argument))]
++    pub glass_glide_union: Option<FloatOrInt<0, 256>>,
+     #[knuffel(child, unwrap(argument))]
+     pub blur: Option<bool>,
+     #[knuffel(child, unwrap(argument))]
+@@ -1204,6 +1213,10 @@ pub struct BackgroundEffect {
+     pub glass_focus_scrim_below: Option<f64>,
+     /// Matrix R126: appearance pop for solitary glass cards.
+     pub glass_pop: Option<bool>,
++    /// Matrix (0019): glide time of the glass body in ms.
++    pub glass_glide: Option<f64>,
++    /// Matrix (0019): union distance while melted by a glide.
++    pub glass_glide_union: Option<f64>,
+ 
+     pub noise: Option<f64>,
+     pub saturation: Option<f64>,
+@@ -1272,6 +1285,12 @@ impl MergeWith<BackgroundEffectRule> for BackgroundEffect {
+         if let Some(x) = part.glass_pop {
+             self.glass_pop = Some(x);
+         }
++        if let Some(x) = part.glass_glide {
++            self.glass_glide = Some(x.0);
++        }
++        if let Some(x) = part.glass_glide_union {
++            self.glass_glide_union = Some(x.0);
++        }
+ 
+         if let Some(x) = part.noise {
+             self.noise = Some(x.0);
+diff --git a/src/layer/mapped.rs b/src/layer/mapped.rs
+index fa06a9e..01a2095 100644
+--- a/src/layer/mapped.rs
++++ b/src/layer/mapped.rs
+@@ -58,6 +58,56 @@ pub struct MappedLayer {
+     /// Matrix R126: the appearance pop of solitary glass cards — the
+     /// compositor scales body AND content together (island spring).
+     pop: Option<Animation>,
++
++    /// Matrix (0019): the glass body gliding to a new place or size.
++    glide: std::cell::RefCell<Glide>,
++}
++
++/// Matrix (0019): where the glass body is drawn while the surface moved.
++/// A client resizes its surface in ONE step (one configure round trip);
++/// the compositor glides the body there in its own frame clock. Before,
++/// the bar stepped five chips every frame and each step waited for a
++/// configure — 13–39 ms a step, visibly jerky on the Duo.
++#[derive(Debug, Default)]
++struct Glide {
++    /// The surface's real rectangle last seen.
++    target: Option<Rectangle<f64, Logical>>,
++    /// The body's rectangle when the current glide began.
++    from: Option<Rectangle<f64, Logical>>,
++    anim: Option<Animation>,
++    /// How melted the body is (0 solitary … 1 fully melted) at the glide's
++    /// start and end: growing a lot melts, shrinking a lot lets go.
++    melt_from: f64,
++    melt_to: f64,
++}
++
++impl Glide {
++    /// The rectangle the body shows now.
++    fn shown(&self) -> Option<Rectangle<f64, Logical>> {
++        let target = self.target?;
++        match (&self.from, &self.anim) {
++            (Some(from), Some(a)) if !a.is_done() => {
++                let t = a.value().clamp(0.0, 1.0);
++                let lerp = |p: f64, q: f64| p + (q - p) * t;
++                Some(Rectangle::new(
++                    Point::from((lerp(from.loc.x, target.loc.x), lerp(from.loc.y, target.loc.y))),
++                    Size::from((lerp(from.size.w, target.size.w), lerp(from.size.h, target.size.h))),
++                ))
++            }
++            _ => Some(target),
++        }
++    }
++
++    /// The melt now (0..1).
++    fn melt(&self) -> f64 {
++        match &self.anim {
++            Some(a) if !a.is_done() => {
++                let t = a.value().clamp(0.0, 1.0);
++                self.melt_from + (self.melt_to - self.melt_from) * t
++            }
++            _ => self.melt_to,
++        }
++    }
+ }
+ 
+ niri_render_elements! {
+@@ -128,6 +178,7 @@ impl MappedLayer {
+             blur_config: config.blur,
+             clock,
+             pop,
++            glide: std::cell::RefCell::new(Glide::default()),
+         }
+     }
+ 
+@@ -165,7 +216,9 @@ impl MappedLayer {
+     }
+ 
+     pub fn are_animations_ongoing(&self) -> bool {
+-        self.rules.baba_is_float || self.pop.as_ref().is_some_and(|a| !a.is_done())
++        self.rules.baba_is_float
++            || self.pop.as_ref().is_some_and(|a| !a.is_done())
++            || self.glide.borrow().anim.as_ref().is_some_and(|a| !a.is_done())
+     }
+ 
+     pub fn surface(&self) -> &LayerSurface {
+@@ -308,7 +361,63 @@ impl MappedLayer {
+         self.shadow
+             .render(ctx.renderer, location, &mut |elem| push(elem.into()));
+ 
+-        let geometry = Rectangle::new(location, self.block_out_buffer.size());
++        let mut geometry = Rectangle::new(location, self.block_out_buffer.size());
++        // Matrix (0019): the glass body glides to a new rectangle. A 1×1
++        // surface counts as hidden: to and from it the body jumps.
++        let glide_ms = self.rules.background_effect.glass_glide.unwrap_or(0.0);
++        if glide_ms > 0.0 && self.rules.background_effect.glass == Some(true) {
++            let mut g = self.glide.borrow_mut();
++            if g.target != Some(geometry) {
++                let hidden = |r: &Rectangle<f64, Logical>| r.size.w <= 2.0 || r.size.h <= 2.0;
++                let shown = g.shown();
++                let melt_now = g.melt();
++                match shown {
++                    Some(old) if !hidden(&old) && !hidden(&geometry) => {
++                        // Growing by more than a tenth melts (chips flowing
++                        // into one band), shrinking as much lets go; a
++                        // clock chip a few points wider keeps its state.
++                        let ratio = (geometry.size.w * geometry.size.h) / (old.size.w * old.size.h).max(1.0);
++                        g.melt_from = melt_now;
++                        g.melt_to = if ratio > 1.1 { 1.0 } else if ratio < 0.91 { 0.0 } else { melt_now };
++                        g.from = Some(old);
++                        g.anim = Some(Animation::new(
++                            self.clock.clone(),
++                            0.,
++                            1.,
++                            0.,
++                            niri_config::Animation {
++                                off: false,
++                                kind: niri_config::animations::Kind::Easing(niri_config::animations::EasingParams {
++                                    duration_ms: glide_ms as u32,
++                                    curve: niri_config::animations::Curve::EaseOutCubic,
++                                }),
++                            },
++                        ));
++                    }
++                    _ => {
++                        // a jump (to or from hidden) keeps the melt
++                        g.from = None;
++                        g.anim = None;
++                        g.melt_from = melt_now;
++                        g.melt_to = melt_now;
++                    }
++                }
++                g.target = Some(geometry);
++            }
++            if let Some(r) = g.shown() {
++                geometry = r;
++            }
++        }
++        // Matrix (0019): the melt raises the Murano union while the bodies
++        // flow together (one poured form: no seams, rims or shadows between).
++        let mut effect = self.rules.background_effect;
++        if let Some(u) = effect.glass_glide_union.filter(|u| *u > 0.0 && glide_ms > 0.0) {
++            let melt = self.glide.borrow().melt();
++            let melted = u * melt;
++            if melted > effect.glass_union.unwrap_or(0.0) {
++                effect.glass_union = Some(melted);
++            }
++        }
+         let surface_off = Point::new(0., 0.); // No geometry on layer surfaces.
+         let surface_anim_scale = Scale::from(1.);
+         let radius = self.rules.geometry_corner_radius.unwrap_or_default();
+@@ -323,7 +432,7 @@ impl MappedLayer {
+             surface_anim_scale,
+             self.blur_config,
+             radius,
+-            self.rules.background_effect,
++            effect,
+             pop_fade,
+             should_block_out,
+             xray_pos,

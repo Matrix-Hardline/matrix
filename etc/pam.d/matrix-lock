@@ -1,0 +1,6 @@
+# Matrix lock screen — verifies the logged-in user's password via the
+# system authentication stack (like swaylock/gtklock). The binary asks
+# PAM for the service "matrix-lock" (apps/lock/src/pam.rs); without this
+# file PAM falls back to /etc/pam.d/other and rejects EVERY password.
+auth       include      system-auth
+account    include      system-auth

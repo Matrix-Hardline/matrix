@@ -1,0 +1,112 @@
+diff --git a/src/backend/tty.rs b/src/backend/tty.rs
+index 0160a4b..59811ad 100644
+--- a/src/backend/tty.rs
++++ b/src/backend/tty.rs
+@@ -413,6 +413,74 @@ struct ConnectorProperties<'a> {
+     requests: AtomicModeReq,
+ }
+ 
++/// Matrix (03.11.2026, Surface Duo): bring the panels up in a fixed order.
++///
++/// The Duo's two DSI panels are lit by their first commit. When the second panel's controller
++/// came up before the first («[DSI_1] IRQ registered» before DSI_0), the driver reported
++/// «dsi FIFO UNDERFLOW» and both panels showed noise until the compositor restarted — on
++/// 25 of 25 starts, whichever niri build; renaming and CRTC pinning did not help. Here every
++/// other output waits with its first frame until the leading output has shown one (its first
++/// vblank), at most 1.5 s. The same holds after the monitors were powered off (fold, power key):
++/// waking them brought DSI_1 up first again. The leader comes from /run/duo/niri-first-output, else
++/// NIRI_CANVAS_FIRST_OUTPUT, else «DSI-1» on a Surface Duo; elsewhere nothing waits.
++mod first_light {
++    use std::sync::atomic::{AtomicBool, Ordering};
++    use std::sync::{Mutex, OnceLock};
++    use std::time::Instant;
++
++    static LIT: AtomicBool = AtomicBool::new(false);
++    static SINCE: Mutex<Option<Instant>> = Mutex::new(None);
++    static LEADER: OnceLock<Option<String>> = OnceLock::new();
++
++    pub fn leader() -> Option<&'static str> {
++        LEADER
++            .get_or_init(|| {
++                if let Ok(s) = std::fs::read_to_string("/run/duo/niri-first-output") {
++                    let s = s.trim().to_string();
++                    return (!s.is_empty() && s != "none").then_some(s);
++                }
++                if let Ok(s) = std::env::var("NIRI_CANVAS_FIRST_OUTPUT") {
++                    return (!s.is_empty() && s != "none").then_some(s);
++                }
++                let model = std::fs::read("/proc/device-tree/model").unwrap_or_default();
++                model.starts_with(b"Surface Duo").then(|| String::from("DSI-1"))
++            })
++            .as_deref()
++    }
++
++    /// May `name` render now?
++    pub fn may_render(name: &str) -> bool {
++        let Some(leader) = leader() else { return true };
++        if name == leader || LIT.load(Ordering::Relaxed) {
++            return true;
++        }
++        let since = *SINCE.lock().unwrap().get_or_insert_with(Instant::now);
++        if since.elapsed().as_millis() > 1500 {
++            LIT.store(true, Ordering::Relaxed);
++            warn!("first light: {leader} showed no frame in 1.5 s, {name} goes ahead");
++            return true;
++        }
++        false
++    }
++
++    /// The monitors went dark: the next wake follows the same order.
++    pub fn reset() {
++        LIT.store(false, Ordering::Relaxed);
++        *SINCE.lock().unwrap() = None;
++    }
++
++    /// A vblank on `name`: true the first time the leader lit up.
++    pub fn vblank(name: &str) -> bool {
++        match leader() {
++            Some(leader) if name == leader && !LIT.swap(true, Ordering::Relaxed) => {
++                info!("first light: {leader} is up, the other outputs follow");
++                true
++            }
++            _ => false,
++        }
++    }
++}
++
+ impl Tty {
+     pub fn new(
+         config: Rc<RefCell<Config>>,
+@@ -1638,6 +1706,9 @@ impl Tty {
+         let name = &surface.name.connector;
+         trace!("vblank on {name} {meta:?}");
+         span.emit_text(name);
++        if first_light::vblank(name) {
++            niri.queue_redraw_all();
++        }
+ 
+         let presentation_time = match meta.time {
+             DrmEventTime::Monotonic(time) => time,
+@@ -1875,6 +1946,12 @@ impl Tty {
+             return rv;
+         }
+ 
++        if !first_light::may_render(&surface.name.connector) {
++            // Matrix: wait for the leading panel's first frame (see first_light).
++            niri.queue_redraw(output);
++            return rv;
++        }
++
+         let mut renderer = match self.gpu_manager.renderer(
+             &self.primary_render_node,
+             &device.render_node.unwrap_or(self.primary_render_node),
+@@ -2260,6 +2337,9 @@ impl Tty {
+             return;
+         }
+ 
++        // Matrix: waking follows the first-light order again.
++        first_light::reset();
++
+         for device in self.devices.values_mut() {
+             for surface in device.surfaces.values_mut() {
+                 if let Err(err) = surface.compositor.clear() {

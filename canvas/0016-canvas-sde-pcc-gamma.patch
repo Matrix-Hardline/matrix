@@ -1,0 +1,110 @@
+diff --git a/src/backend/tty.rs b/src/backend/tty.rs
+index 877953f..9c74819 100644
+--- a/src/backend/tty.rs
++++ b/src/backend/tty.rs
+@@ -413,6 +413,10 @@ struct GammaProps {
+     gamma_lut: property::Handle,
+     gamma_lut_size: property::Handle,
+     previous_blob: Option<NonZeroU64>,
++    /// Matrix (Surface Duo, SDE display driver): no GAMMA_LUT — `gamma_lut`
++    /// is the vendor PCC colour correction (`SDE_DSPP_PCC_V*`), set from
++    /// the ramps' end points (Night Shift is a per-channel gain).
++    pcc: bool,
+ }
+ 
+ struct ConnectorProperties<'a> {
+@@ -2721,6 +2725,7 @@ impl GammaProps {
+     fn new(device: &DrmDevice, crtc: crtc::Handle) -> anyhow::Result<Self> {
+         let mut gamma_lut = None;
+         let mut gamma_lut_size = None;
++        let mut pcc = None;
+ 
+         let props = device
+             .get_properties(crtc)
+@@ -2742,6 +2747,11 @@ impl GammaProps {
+                     );
+                     gamma_lut = Some(prop);
+                 }
++                name if name.starts_with("SDE_DSPP_PCC_V")
++                    && matches!(info.value_type(), property::ValueType::Blob) =>
++                {
++                    pcc = Some(prop);
++                }
+                 "GAMMA_LUT_SIZE" => {
+                     ensure!(
+                         matches!(info.value_type(), property::ValueType::UnsignedRange(_, _)),
+@@ -2753,6 +2763,19 @@ impl GammaProps {
+             }
+         }
+ 
++        if gamma_lut.is_none() {
++            if let Some(pcc) = pcc {
++                debug!("crtc {crtc:?}: no GAMMA_LUT, using the SDE PCC colour correction");
++                return Ok(Self {
++                    crtc,
++                    gamma_lut: pcc,
++                    gamma_lut_size: pcc,
++                    previous_blob: None,
++                    pcc: true,
++                });
++            }
++        }
++
+         let gamma_lut = gamma_lut.context("missing GAMMA_LUT property")?;
+         let gamma_lut_size = gamma_lut_size.context("missing GAMMA_LUT_SIZE property")?;
+ 
+@@ -2761,10 +2784,15 @@ impl GammaProps {
+             gamma_lut,
+             gamma_lut_size,
+             previous_blob: None,
++            pcc: false,
+         })
+     }
+ 
+     fn gamma_size(&self, device: &DrmDevice) -> anyhow::Result<u32> {
++        if self.pcc {
++            // Any ramp length works: only its end points are used.
++            return Ok(256);
++        }
+         let value = get_drm_property(device, self.crtc, self.gamma_lut_size)
+             .context("missing GAMMA_LUT_SIZE property")?;
+         Ok(value as u32)
+@@ -2790,6 +2818,30 @@ impl GammaProps {
+                 pub reserved: u16,
+             }
+ 
++            if self.pcc {
++                // Gains from the ramps' last entries; 0x8000 = 1.0 (SDE PCC v4).
++                // A neutral ramp switches the correction off (blob 0).
++                let gain = |ramp: &[u16]| ramp.last().map_or(1.0, |&v| f64::from(v) / 65535.0);
++                let (r, rest) = gamma.split_at(gamma_size);
++                let (g, b) = rest.split_at(gamma_size);
++                let gains = [gain(r), gain(g), gain(b)];
++                if gains.iter().all(|g| *g > 0.999) {
++                    None
++                } else {
++                    // struct drm_msm_pcc: u64 flags, 3 × 8 u32 coefficients
++                    // (c r g b rg gb rb rgb), 9 u32 second order; 144 bytes.
++                    let mut data = [0u8; 144];
++                    for (ch, g) in gains.iter().enumerate() {
++                        let value = (g.clamp(0.0, 1.0) * 32768.0).round() as u32;
++                        // Coefficient `r` of red, `g` of green, `b` of blue.
++                        let at = 8 + ch * 32 + (1 + ch) * 4;
++                        data[at..at + 4].copy_from_slice(&value.to_ne_bytes());
++                    }
++                    let blob = drm_ffi::mode::create_property_blob(device.as_fd(), &mut data)
++                        .context("error creating PCC blob")?;
++                    NonZeroU64::new(u64::from(blob.blob_id))
++                }
++            } else {
+             let (red, rest) = gamma.split_at(gamma_size);
+             let (blue, green) = rest.split_at(gamma_size);
+             let mut data = zip(zip(red, blue), green)
+@@ -2805,6 +2857,7 @@ impl GammaProps {
+             let blob = drm_ffi::mode::create_property_blob(device.as_fd(), data)
+                 .context("error creating property blob")?;
+             NonZeroU64::new(u64::from(blob.blob_id))
++            }
+         } else {
+             None
+         };

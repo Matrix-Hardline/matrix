@@ -1,0 +1,27 @@
+diff --git a/src/utils/spawning.rs b/src/utils/spawning.rs
+index 8c2ae81..6c75943 100644
+--- a/src/utils/spawning.rs
++++ b/src/utils/spawning.rs
+@@ -335,7 +335,21 @@ mod systemd {
+                                 closefrom(raw + 1);
+                             }
+ 
+-                            let _ = read_all(pipe, &mut [0]);
++                            // Matrix (round 48, Surface Duo 03.11.2026): wait for the
++                            // signal at most 10 s. One intermediate child hung 6 h in
++                            // this read; being a fork of niri it kept every client
++                            // buffer niri had mapped at that moment alive (714 MB of
++                            // shared memory). Its work is done in milliseconds — the
++                            // grandchild runs on its own — so leave after a bound.
++                            // poll() is async-signal-safe after fork.
++                            let mut pfd = libc::pollfd {
++                                fd: pipe.as_raw_fd(),
++                                events: libc::POLLIN,
++                                revents: 0,
++                            };
++                            if libc::poll(&mut pfd, 1, 10_000) > 0 {
++                                let _ = read_all(pipe, &mut [0]);
++                            }
+                         }
+ 
+                         libc::_exit(0)

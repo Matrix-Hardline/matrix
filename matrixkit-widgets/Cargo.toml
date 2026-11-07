@@ -1,0 +1,35 @@
+[package]
+name = "matrixkit-widgets"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+description = "Gemeinsame MatrixKit-Bausteine: Theme-Header, Resize-Griffe, Farb-Helfer"
+
+[dependencies]
+serde_json = "1"
+libc = "0.2"
+matrixkit-theme = { path = "../matrixkit-theme" }
+matrixkit-icons = { path = "../matrixkit-icons" }
+# R207: the light families live in their own crate; mkw re-exports them.
+matrixkit-scene = { path = "../matrixkit-scene" }
+# Camp 6 of the iced replacement: the scene families measure their
+# text runs themselves — iced-free, directly via the kit's text engine.
+matrixkit-text = { path = "../matrixkit-text" }
+# Camp 17: the fleet lives in the window house; mkw re-exports it.
+matrixkit-shell = { path = "../matrixkit-shell" }
+matrixkit-image = { path = "../matrixkit-image" }
+# Stage 0: mkw is the ONE gate to iced — the feature list is the
+# UNION of all app needs (the apps no longer declare iced).
+iced = { version = "0.14", features = ["thread-pool", "image", "advanced", "canvas", "markdown", "highlighter", "svg"] }
+iced_layershell = "0.18"
+iced_sessionlock = { git = "https://github.com/waycrate/exwlshelleventloop", rev = "4248a0d10ee6e0a72a98c9d0534972faf91913ce" }
+bytemuck = { version = "1", features = ["derive"] }
+wgpu = "27"
+futures = "0.3"
+# R106: glass needs the wallpaper backdrop — image is a core dependency now.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+[features]
+# Legacy no-op (pre-R106 callers still pass it); image is core now.
+bild = []
+picture = []

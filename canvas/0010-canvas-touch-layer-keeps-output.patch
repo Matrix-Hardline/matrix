@@ -1,0 +1,17 @@
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -4258,7 +4258,13 @@
+ 
+                 // FIXME: granular.
+                 self.niri.queue_redraw_all();
+-            } else if let Some(output) = under.output {
++            } else if let Some(output) = under.output.filter(|_| under.layer.is_none()) {
++                // Matrix (R209, Surface Duo): a touch on a shell surface (layer:
++                // on-screen keyboard, bar, dock) must not move the output focus.
++                // The duo's keyboard sits on the OTHER panel than the search it
++                // types into; focusing its output took the keyboard focus away
++                // from that panel's exclusive layer, so no key ever arrived.
++                // On-demand layers still take focus just below.
+                 self.niri.layout.focus_output(&output);
+ 
+                 // FIXME: granular.

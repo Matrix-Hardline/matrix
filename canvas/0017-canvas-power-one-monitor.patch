@@ -1,0 +1,201 @@
+# 0017 (04.11.2026, Runde 84): Ein Panel einzeln ausschalten (Surface Duo zurueckgeklappt).
+# power-off-monitor <OUT>: CRTC inaktiv wie power-off-monitors, kein Zeichnen fuer diesen Ausgang.
+# power-on-monitor <OUT>: alle Ausgaenge einmal aus/an -> Aufwachen in der first-light-Reihenfolge (0015).
+diff --git a/niri-config/src/binds.rs b/niri-config/src/binds.rs
+index e1a6a54..5f04184 100644
+--- a/niri-config/src/binds.rs
++++ b/niri-config/src/binds.rs
+@@ -109,6 +109,8 @@ pub enum Action {
+     Suspend,
+     PowerOffMonitors,
+     PowerOnMonitors,
++    PowerOffMonitor(#[knuffel(argument)] String),
++    PowerOnMonitor(#[knuffel(argument)] String),
+     ToggleDebugTint,
+     DebugToggleOpaqueRegions,
+     DebugToggleDamage,
+@@ -401,6 +403,8 @@ impl From<niri_ipc::Action> for Action {
+             niri_ipc::Action::Quit { skip_confirmation } => Self::Quit(skip_confirmation),
+             niri_ipc::Action::PowerOffMonitors {} => Self::PowerOffMonitors,
+             niri_ipc::Action::PowerOnMonitors {} => Self::PowerOnMonitors,
++            niri_ipc::Action::PowerOffMonitor { output } => Self::PowerOffMonitor(output),
++            niri_ipc::Action::PowerOnMonitor { output } => Self::PowerOnMonitor(output),
+             niri_ipc::Action::Spawn { command } => Self::Spawn(command),
+             niri_ipc::Action::SpawnSh { command } => Self::SpawnSh(command),
+             niri_ipc::Action::DoScreenTransition { delay_ms } => Self::DoScreenTransition(delay_ms),
+diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
+index 218e532..98fa01d 100644
+--- a/niri-ipc/src/lib.rs
++++ b/niri-ipc/src/lib.rs
+@@ -202,6 +202,20 @@ pub enum Action {
+     PowerOffMonitors {},
+     /// Power on all monitors via DPMS.
+     PowerOnMonitors {},
++    /// Matrix: power off ONE monitor (its CRTC goes inactive, nothing is drawn
++    /// for it) — a folded Surface Duo's back panel.
++    PowerOffMonitor {
++        /// The output name.
++        #[cfg_attr(feature = "clap", arg())]
++        output: String,
++    },
++    /// Matrix: power that monitor on again (all monitors cycle once, so the
++    /// panels wake in the first-light order).
++    PowerOnMonitor {
++        /// The output name.
++        #[cfg_attr(feature = "clap", arg())]
++        output: String,
++    },
+     /// Spawn a command.
+     Spawn {
+         /// Command to spawn.
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index 49fbc6b..02b9074 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -177,6 +177,15 @@ impl Backend {
+         }
+     }
+ 
++    /// Matrix: one output's CRTC inactive (`active` = false) — see Tty.
++    pub fn set_output_active(&mut self, name: &str, active: bool) {
++        match self {
++            Backend::Tty(tty) => tty.set_output_active(name, active),
++            Backend::Winit(_) => (),
++            Backend::Headless(_) => (),
++        }
++    }
++
+     pub fn set_output_on_demand_vrr(&mut self, niri: &mut Niri, output: &Output, enable_vrr: bool) {
+         match self {
+             Backend::Tty(tty) => tty.set_output_on_demand_vrr(niri, output, enable_vrr),
+diff --git a/src/backend/tty.rs b/src/backend/tty.rs
+index 9c74819..59c811e 100644
+--- a/src/backend/tty.rs
++++ b/src/backend/tty.rs
+@@ -2383,6 +2383,24 @@ impl Tty {
+         }
+     }
+ 
++    /// Matrix: clear ONE output's surface (CRTC inactive), like
++    /// `set_monitors_active(false)` does for all. Waking goes through the
++    /// next rendered frame (queue_frame activates the CRTC again).
++    pub fn set_output_active(&mut self, name: &str, active: bool) {
++        if active {
++            return;
++        }
++        for device in self.devices.values_mut() {
++            for surface in device.surfaces.values_mut() {
++                if surface.name.connector == name {
++                    if let Err(err) = surface.compositor.clear() {
++                        warn!("error clearing drm surface {name}: {err:?}");
++                    }
++                }
++            }
++        }
++    }
++
+     pub fn set_output_on_demand_vrr(&mut self, niri: &mut Niri, output: &Output, enable_vrr: bool) {
+         let _span = tracy_client::span!("Tty::set_output_on_demand_vrr");
+ 
+diff --git a/src/input/mod.rs b/src/input/mod.rs
+index fd708a5..b6f3dad 100644
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -709,6 +709,12 @@ impl State {
+             Action::PowerOnMonitors => {
+                 self.niri.activate_monitors(&mut self.backend);
+             }
++            Action::PowerOffMonitor(output) => {
++                self.niri.deactivate_monitor(&mut self.backend, &output);
++            }
++            Action::PowerOnMonitor(output) => {
++                self.niri.activate_monitor(&mut self.backend, &output);
++            }
+             Action::ToggleDebugTint => {
+                 self.backend.toggle_debug_tint();
+                 self.niri.queue_redraw_all();
+@@ -4726,6 +4732,8 @@ fn allowed_when_locked(action: &Action) -> bool {
+             | Action::Suspend
+             | Action::PowerOffMonitors
+             | Action::PowerOnMonitors
++            | Action::PowerOffMonitor(_)
++            | Action::PowerOnMonitor(_)
+             | Action::SwitchLayout(_)
+             | Action::ToggleKeyboardShortcutsInhibit
+     )
+@@ -4739,6 +4747,8 @@ fn allowed_during_screenshot(action: &Action) -> bool {
+             | Action::Suspend
+             | Action::PowerOffMonitors
+             | Action::PowerOnMonitors
++            | Action::PowerOffMonitor(_)
++            | Action::PowerOnMonitor(_)
+             // Intended for binds such as volume up/down, lock the screen, etc.
+             | Action::Spawn(_)
+             | Action::SpawnSh(_)
+diff --git a/src/niri.rs b/src/niri.rs
+index 2bc29ff..91d3e32 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -262,6 +262,10 @@ pub struct Niri {
+     // When false, we're idling with monitors powered off.
+     pub monitors_active: bool,
+ 
++    /// Matrix: outputs powered off ONE BY ONE (a folded Duo's back panel) —
++    /// nothing is drawn for them while `monitors_active` stays true.
++    pub dark_outputs: HashSet<String>,
++
+     /// Whether the laptop lid is closed.
+     ///
+     /// Libinput guarantees that the lid switch starts in open state, and if it was closed during
+@@ -2535,6 +2539,7 @@ impl Niri {
+             blocker_cleared_tx,
+             blocker_cleared_rx,
+             monitors_active: true,
++            dark_outputs: HashSet::new(),
+             is_lid_closed: false,
+ 
+             devices: HashSet::new(),
+@@ -3062,6 +3067,34 @@ impl Niri {
+         backend.set_monitors_active(false);
+     }
+ 
++    /// Matrix: power off one output (by name). Its CRTC goes inactive like
++    /// for `deactivate_monitors`, and it is not drawn until powered on.
++    pub fn deactivate_monitor(&mut self, backend: &mut Backend, name: &str) {
++        if !self.output_state.keys().any(|o| o.name() == name) {
++            warn!("power-off-monitor: no output {name}");
++            return;
++        }
++        if self.dark_outputs.insert(name.to_string()) {
++            info!("power-off-monitor: {name} dark");
++            backend.set_output_active(name, false);
++        }
++    }
++
++    /// Matrix: power that output on again. On the Duo the panels must wake in
++    /// the first-light order (DSI-1 before DSI-2, else both show noise until a
++    /// restart), so all monitors cycle once — the power key's proven path.
++    pub fn activate_monitor(&mut self, backend: &mut Backend, name: &str) {
++        if !self.dark_outputs.remove(name) {
++            return;
++        }
++        info!("power-on-monitor: {name} wakes (all monitors cycle once)");
++        if self.monitors_active {
++            backend.set_monitors_active(false);
++            backend.set_monitors_active(true);
++        }
++        self.queue_redraw_all();
++    }
++
+     pub fn activate_monitors(&mut self, backend: &mut Backend) {
+         if self.monitors_active {
+             return;
+@@ -4662,7 +4695,7 @@ impl Niri {
+         self.update_render_elements(Some(output));
+ 
+         let mut res = RenderResult::Skipped;
+-        if self.monitors_active {
++        if self.monitors_active && !self.dark_outputs.contains(&output.name()) {
+             let state = self.output_state.get_mut(output).unwrap();
+             state.unfinished_animations_remain = self.layout.are_animations_ongoing(Some(output));
+             state.unfinished_animations_remain |=
